@@ -1,0 +1,68 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+loggerj
+loggerj.test
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+*.coverprofile
+
+# Dependency directories
+vendor/
+node_modules/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS
+Thumbs.db
+
+# Benchmark and profiling outputs
+*.prof
+*.cpu
+*.mem
+cpu.out
+mem.out
+bench.out
+
+# Log files (test outputs)
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Build artifacts
+dist/
+build/
+
+# Environment variables
+.env
+.env.local
+
+# Docker
+.dockerignore
+
+# Documentation build
+docs/_build/
+
+# Generated files
+*.generated.go

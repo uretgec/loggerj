@@ -174,8 +174,8 @@ go tool pprof -http=:8080 cpu.out
 
 ## Documentation
 
-- [Usage Examples](examples.md) - Comprehensive examples for all features
-- [Benchmark Results](bench.md) - Detailed performance analysis
+- [Usage Examples](EXAMPLES.md) - Comprehensive examples for all features
+- [Benchmark Results](BENCH.md) - Detailed performance analysis
 
 ---
 

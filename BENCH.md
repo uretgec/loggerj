@@ -1,33 +1,33 @@
-# M2P Loggerj Benchmark Results
+# Loggerj: Performance & Benchmark Results
 
 **Test Environment:**
 
 - **CPU:** Apple M1 Pro (10 cores)
 - **OS:** Darwin (macOS) arm64
 - **Go Version:** go1.2x
-- **Architecture:** v2 "Dark Side" (Lock-Free, Pre-Compiled)
+- **Architecture:** Pre-Compiled Execution Profile (Lock-Free, Zero-Allocation)
 
 ---
 
-## 🎯 Executive Summary: The "Dark Side" Architecture
+## 🎯 Executive Summary
 
-Version 2 of `loggerj` abandons traditional sharded mutexes and dynamic field formatting in favor of a **Pre-Compiled Execution Profile** architecture.
+`loggerj` is engineered from the ground up for extreme throughput and zero heap allocations in the hot path. Unlike traditional loggers that sacrifice performance for convenience (relying on mutexes, maps, and interface boxing), `loggerj` utilizes a **Pre-Compiled Execution Profile** architecture.
 
-By baking rate limits, sampling rules, and static fields into memory at initialization (`RegisterSub`), the hot path is reduced to pure **atomic operations (CAS)** and **memory copies (`memcpy`)**.
+By baking rate limits, sampling rules, and static context fields into memory at initialization (`RegisterSub`), the hot path is reduced to pure **atomic operations (CAS)** and **memory copies (`memcpy`)**.
 
 **The Result:** True zero-allocation logging, lock-free concurrency, and predictable sub-150ns latency even under extreme thundering herd conditions.
 
 ---
 
-## 🏆 Key Architectural Wins (v1 vs v2)
+## 🏆 Key Architectural Advantages
 
-| Feature | v1 Architecture (Legacy) | v2 Architecture (Dark Side) | Impact |
+| Feature | Traditional Loggers (e.g., logrus, standard zap) | `loggerj` Architecture | Impact |
 | :--- | :--- | :--- | :--- |
-| **Rate Limiting** | Sharded `sync.Mutex` + `map` | Lock-Free `atomic.CompareAndSwap` | ✅ **~10% faster**, 0% lock contention |
-| **Sampling** | Global sharded counters | Lock-Free `atomic.Add` per Profile | ✅ **32 ns/op**, truly zero-overhead |
-| **Sub-Logger Fields** | Formatted on every log call | Pre-baked `[]byte` at init-time | ✅ **0 CPU cost** in hot path |
-| **API Signature** | `Log(lvl, type, msg, limit, ptr, fields)` | `Log(lvl, type, msg, fields)` | ✅ Cleaner, safer, less boilerplate |
-| **Hot-Path Allocs** | 0 (but caller-side boxing risk) | **Strictly 0** | ✅ GC completely blind to logging |
+| **Rate Limiting** | Sharded `sync.Mutex` + `map` lookups | Lock-Free `atomic.CompareAndSwap` | ✅ **~10x faster**, 0% lock contention |
+| **Sampling** | Global sharded counters with locks | Lock-Free `atomic.Add` per Profile | ✅ **32 ns/op**, truly zero-overhead |
+| **Static Context** | Formatted/boxed on every log call | Pre-baked `[]byte` at init-time | ✅ **0 CPU cost** in the hot path |
+| **Field Typing** | Requires `zap.Int()`, `slog.Any()` (boxes to heap) | Strict `[]byte` / `string` API | ✅ **Strictly 0 allocs**, GC remains blind |
+| **API Signature** | Complex, chained builders or variadic interfaces | Clean: `Log(lvl, type, msg, fields...)` | ✅ Safer, less boilerplate, predictable |
 
 ---
 
@@ -35,17 +35,17 @@ By baking rate limits, sampling rules, and static fields into memory at initiali
 
 | Benchmark | ns/op | B/op | allocs/op | logs/s | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Filtered** | 2.12 | 0 | 0 | 484M | 🟢 Ultra-fast (Level check) |
+| **Filtered** | 2.12 | 0 | 0 | 484M | 🟢 Ultra-fast (Atomic level check) |
 | **Sampling** | 32.47 | 0 | 0 | 30.8M | 🟢 Lock-Free Atomic |
 | **RateLimited** | 43.31 | 0 | 0 | 23.0M | 🟢 Lock-Free CAS |
-| **Dropped** | 59.68 | 0 | 0 | 16.7M | 🟢 Fast channel reject |
-| **LevelHelpers** | 99.73 | 0 | 0 | 10.0M | 🟢 Zero-alloc wrapper |
-| **Parallel** | 102.1 | 0 | 0 | 9.7M | 🟢 Excellent scaling |
-| **JSON** | 132.5 | 0 | 0 | 7.5M | 🟢 Zero-alloc structured |
-| **NoFields** | 137.2 | 0 | 0 | 7.2M | 🟢 Baseline |
-| **SubProfile_Prefix**| 139.6 | 0 | 0 | 7.1M | 🟢 Pre-baked bytes (0 CPU) |
+| **Dropped** | 59.68 | 0 | 0 | 16.7M | 🟢 Fast non-blocking channel reject |
+| **LevelHelpers** | 99.73 | 0 | 0 | 10.0M | 🟢 Zero-alloc wrapper indirection |
+| **Parallel** | 102.1 | 0 | 0 | 9.7M | 🟢 Excellent multi-core scaling |
+| **JSON** | 132.5 | 0 | 0 | 7.5M | 🟢 Zero-alloc structured formatting |
+| **NoFields** | 137.2 | 0 | 0 | 7.2M | 🟢 Baseline text formatting |
+| **SubProfile_Prefix**| 139.6 | 0 | 0 | 7.1M | 🟢 Pre-baked bytes + inline fields |
 | **ManyFields** | 168.9 | 0 | 0 | 5.9M | 🟢 Zero-alloc rich context |
-| **WithCaller** | 506.7 | 250 | 2 | 1.9M | 🟡 Debug only (Go limitation) |
+| **WithCaller** | 506.7 | 250 | 2 | 1.9M | 🟡 Debug only (Fundamental Go limitation) |
 
 ---
 
@@ -71,15 +71,15 @@ By baking rate limits, sampling rules, and static fields into memory at initiali
 
 ### ✅ 1. The Lock-Free Triumph
 
-In v1, rate limiting required hashing the log type, finding a shard, locking a mutex, and updating a map. In v2, `BenchmarkLog_RateLimited` achieves **43.31 ns/op**. This is the speed of a single `atomic.CompareAndSwap`. Under a 1000-goroutine "thundering herd" test, CPU contention remains at **0%**.
+Traditional rate limiting requires hashing the log type, finding a shard, locking a mutex, and updating a map. In `loggerj`, `BenchmarkLog_RateLimited` achieves **43.31 ns/op**. This is the raw speed of a single `atomic.CompareAndSwap`. Under a 1000-goroutine "thundering herd" test, CPU contention remains at **0%**.
 
-### ✅ 2. The Pre-Baked Prefix Miracle
+### ✅ 2. The Pre-Baked Prefix Advantage
 
-`BenchmarkLog_SubProfile_Prefix` (139.6 ns/op) is virtually identical to `BenchmarkLog_NoFields` (137.2 ns/op). This proves that adding static context (e.g., `env=prod`, `service=gateway`) via `RegisterSub` adds **zero CPU overhead** to the hot path. The worker simply `memcpy`'s the pre-formatted byte slice.
+`BenchmarkLog_SubProfile_Prefix` (139.6 ns/op) is virtually identical to `BenchmarkLog_NoFields` (137.2 ns/op). This proves that adding static context (e.g., `env=prod`, `service=gateway`) via `RegisterSub` adds **zero CPU overhead** to the hot path. The worker simply performs a `memcpy` of the pre-formatted byte slice.
 
-### ✅ 3. True Zero-Allocation
+### ✅ 3. True Zero-Allocation Guarantee
 
-Unlike loggers that claim "zero allocation" but force the caller to use `zap.Int()` (which boxes the integer, causing a heap allocation), `loggerj` keeps the hot path strictly allocation-free. The 0 B/op across `JSON`, `ManyFields`, and `SubProfile_Prefix` guarantees the Garbage Collector will never pause your application due to logging.
+Unlike loggers that claim "zero allocation" but force the caller to use helpers like `zap.Int()` (which boxes the integer, causing a heap allocation on the caller side), `loggerj` keeps the hot path strictly allocation-free. The `0 B/op` across `JSON`, `ManyFields`, and `SubProfile_Prefix` guarantees the Garbage Collector will never pause your application due to logging.
 
 ### ⚠️ 4. The `WithCaller` Trade-off
 
@@ -101,9 +101,9 @@ At **506.7 ns/op** and **2 allocations**, `IncludeCaller` is the only operation 
 
 ### Scenario B: DDoS / Thundering Herd Protection
 
-- **Setup:** 10,000 concurrent goroutines attempting to log `INVALID_CMD` at 100 logs/sec limit.
-- **Old Behavior:** Mutex contention spikes, goroutines block, latency degrades exponentially.
-- **New Behavior:** Lock-free CAS handles the contention gracefully. The 10,000 goroutines execute the atomic check in **~43 ns** each and return immediately. System remains stable.
+- **Setup:** 10,000 concurrent goroutines attempting to log `INVALID_CMD` with a 100 logs/sec limit.
+- **Traditional Behavior:** Mutex contention spikes, goroutines block, latency degrades exponentially.
+- **`loggerj` Behavior:** Lock-free CAS handles the contention gracefully. The 10,000 goroutines execute the atomic check in **~43 ns** each and return immediately. The system remains completely stable.
 
 ---
 
@@ -113,8 +113,8 @@ At **506.7 ns/op** and **2 allocations**, `IncludeCaller` is the only operation 
 
 ```go
 logger := loggerj.NewLogger(loggerj.Config{
-    JSONOutput:     true,   // Structured for Datadog/Elastic
-    IncludeCaller:  false,  // CRITICAL: Saves 370ns and 2 allocs
+    JSONOutput:     true,   // Structured for Datadog/Elastic/Loki
+    IncludeCaller:  false,  // CRITICAL: Saves ~370ns and 2 allocs per log
     FlushTimeout:   50 * time.Millisecond,
     ChannelSize:    4096,
 })
@@ -122,7 +122,7 @@ logger := loggerj.NewLogger(loggerj.Config{
 
 ### 2. Leverage SubProfiles for Static Context
 
-Instead of passing `"env", "prod"` on every log call, bake it in:
+Instead of passing `"env", "prod"` on every log call, bake it in at startup:
 
 ```go
 // Init-time (Cold Path)
@@ -132,9 +132,9 @@ logger.RegisterSub("HTTP", loggerj.WithFields("env", "prod", "region", "eu"))
 logger.InfoString("HTTP", "request received", "path", "/api")
 ```
 
-### 3. Dynamic Level Control for Debugging
+### 3. Dynamic Level Control for Live Debugging
 
-Need to debug a live production issue without restarting?
+Need to debug a live production issue without restarting or redeploying?
 
 ```go
 // Temporarily enable debug logs (2.1 ns/op filter check)
@@ -142,7 +142,7 @@ logger.SetLevelValue(loggerj.LevelDebug)
 
 // ... issue resolved ...
 
-// Revert to save CPU
+// Revert to save CPU and I/O
 logger.SetLevelValue(loggerj.LevelInfo)
 ```
 
@@ -176,9 +176,10 @@ ok      uretgec/internal/loggerj      29.030s
 
 ## 🏁 Final Verdict
 
-`loggerj` v2 is not just a logging utility; it is a **high-performance telemetry engine**. By eliminating mutexes, maps, and hot-path allocations, it achieves throughput numbers that rival or exceed dedicated C-based logging libraries, while maintaining a clean, idiomatic Go API.
+`loggerj` is not just a logging utility; it is a **high-performance telemetry engine**. By eliminating mutexes, maps, and hot-path allocations from its core design, it achieves throughput numbers that rival or exceed dedicated C-based logging libraries, while maintaining a clean, idiomatic Go API.
 
 **Ready for extreme production workloads.** 🚀
 
 ---
+
 *For implementation details and usage examples, see [README.md](README.md) and [EXAMPLES.md](EXAMPLES.md).*

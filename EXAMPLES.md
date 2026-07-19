@@ -1,8 +1,6 @@
 # loggerj - Usage Examples
 
-Comprehensive examples for all `loggerj` features, configurations, and the new **Pre-Compiled SubProfile** architecture.
-
----
+Comprehensive examples for all `loggerj` features, configurations, and the Pre-Compiled SubProfile architecture.
 
 ## Table of Contents
 
@@ -26,7 +24,7 @@ Comprehensive examples for all `loggerj` features, configurations, and the new *
   - [10. Error Context \& Structured Fields](#10-error-context--structured-fields)
   - [11. Custom Writer \& Test Helper](#11-custom-writer--test-helper)
     - [Custom Writer (e.g., Kafka)](#custom-writer-eg-kafka)
-    - [Test Helper](#test-helper)
+    - [Test Helper (Deterministic, No Sleeps)](#test-helper-deterministic-no-sleeps)
   - [12. Production Configurations](#12-production-configurations)
     - [Standard Production Config](#standard-production-config)
     - [Low-Resource Config (e.g., 512MB RAM, 1 CPU)](#low-resource-config-eg-512mb-ram-1-cpu)
@@ -35,18 +33,27 @@ Comprehensive examples for all `loggerj` features, configurations, and the new *
     - [Metrics Integration (Prometheus)](#metrics-integration-prometheus)
     - [Worker Pool Integration](#worker-pool-integration)
     - [Standard Library Integration (Intercepting `std log`)](#standard-library-integration-intercepting-std-log)
+      - [Output Example](#output-example)
+      - [Performance Note](#performance-note)
   - [14. Observability](#14-observability)
     - [Caller Info (Debug Only)](#caller-info-debug-only)
-    - [Drop Monitoring](#drop-monitoring)
+    - [Drop Monitoring (Polling)](#drop-monitoring-polling)
+    - [Drop Monitoring (Callback — Real-Time)](#drop-monitoring-callback--real-time)
     - [Flush on Signal](#flush-on-signal)
   - [15. Buffer Tuning](#15-buffer-tuning)
+  - [16. Context Integration](#16-context-integration)
+    - [Available Context Keys](#available-context-keys)
+    - [Basic Usage](#basic-usage)
+    - [Nil Context Safety](#nil-context-safety)
+    - [Custom Context Keys](#custom-context-keys)
+    - [Performance](#performance)
   - [Summary](#summary)
 
 ---
 
 ## 1. The SubProfile Paradigm (CRITICAL)
 
-In `loggerj` v2, rate limiting, sampling, and static fields are **no longer passed during the log call**. Instead, they are defined once at startup using `RegisterSub`. This "Pre-Compiled" approach is the secret to our lock-free, zero-allocation hot path.
+In `loggerj` v1, rate limiting, sampling, and static fields are no longer passed during the log call. Instead, they are defined once at startup using `RegisterSub`. This "Pre-Compiled" approach is the secret to our lock-free, zero-allocation hot path.
 
 ```go
 package main
@@ -54,7 +61,8 @@ package main
 import (
     "context"
     "time"
-    "uretgec/internal/loggerj"
+
+    "github.com/uretgec/loggerj"
 )
 
 func main() {
@@ -66,12 +74,11 @@ func main() {
 
     // 2. Register SubProfiles (COLD PATH: Do this ONCE at startup)
     // Rules are baked into memory. Zero hot-path overhead.
-    logger.RegisterSub("HTTP", 
+    logger.RegisterSub("HTTP",
         loggerj.WithRateLimit(1000, time.Second),
         loggerj.WithFields("env", "prod", "service", "gateway"), // Pre-baked prefix!
     )
-    
-    logger.RegisterSub("DB", 
+    logger.RegisterSub("DB",
         loggerj.WithSampleRate(100), // Log 1 out of 100 entries
     )
 
@@ -136,7 +143,7 @@ logger.InfoString("HTTP", "request received",
     "duration_ms", "45")
 ```
 
-**Output:**
+Output:
 
 ```json
 {"ts":1704067200123,"level":"INFO","type":"HTTP","msg":"request received","fields":{"method":"GET","path":"/api/v1/users","status":"200","duration_ms":"45"}}
@@ -154,7 +161,7 @@ logger := loggerj.NewLogger(loggerj.Config{
 logger.InfoString("CONN", "new connection", "addr", "192.168.1.1:54321")
 ```
 
-**Output:**
+Output:
 
 ```txt
 [1704067200123] INFO [CONN] new connection addr=192.168.1.1:54321
@@ -178,7 +185,7 @@ appLogger := loggerj.NewLogger(loggerj.Config{
 auditLogger := loggerj.NewLogger(loggerj.Config{
     OutputFile:   "/var/log/audit.log",
     JSONOutput:   true,
-    FlushTimeout: 10 * time.Millisecond, 
+    FlushTimeout: 10 * time.Millisecond,
 })
 
 ctx, cancel := context.WithCancel(context.Background())
@@ -186,6 +193,7 @@ defer cancel()
 
 go appLogger.Start(ctx)
 go auditLogger.Start(ctx)
+
 defer appLogger.Close()
 defer auditLogger.Close()
 
@@ -221,7 +229,7 @@ defer logger.Close()
 
 ## 6. Sampling & Rate Limiting
 
-In v2, these are handled exclusively via `RegisterSub` to ensure lock-free performance.
+In v1, these are handled exclusively via `RegisterSub` to ensure lock-free performance.
 
 ### Rate Limiting
 
@@ -243,7 +251,7 @@ for i := 0; i < 1000; i++ {
         "cmd", "DROP TABLE",
         "ip", "10.0.0.5")
 }
-// Only ~10 logs will be written per second. The rest are dropped in ~43ns with 0 allocs.
+// Only ~10 logs will be written per second. The rest are dropped in ~41ns with 0 allocs.
 ```
 
 ### Sampling
@@ -325,6 +333,7 @@ func main() {
             }
         }(i)
     }
+
     wg.Wait()
 
     // Wait for signal
@@ -349,8 +358,9 @@ func loggingMiddleware(logger *loggerj.Logger, next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         start := time.Now()
         rw := &responseWriter{ResponseWriter: w, statusCode: 200}
+
         next.ServeHTTP(rw, r)
-        
+
         logger.InfoString("HTTP", "request completed",
             "method", r.Method,
             "path", r.URL.Path,
@@ -368,13 +378,14 @@ func LoggerMiddleware(logger *loggerj.Logger) fiber.Handler {
     return func(c *fiber.Ctx) error {
         start := time.Now()
         err := c.Next()
-        
+
         logger.InfoString("HTTP", "request",
             "method", c.Method(),
             "path", c.Path(),
             "status", fmt.Sprintf("%d", c.Response().StatusCode()),
             "duration_ms", fmt.Sprintf("%d", time.Since(start).Milliseconds()),
             "ip", c.IP())
+
         return err
     }
 }
@@ -401,6 +412,7 @@ func processOrder(logger *loggerj.Logger, orderID string, userID string) error {
         "order_id", orderID,
         "user_id", userID,
         "total", fmt.Sprintf("%.2f", order.Total))
+
     return nil
 }
 ```
@@ -430,7 +442,7 @@ func (w *KafkaWriter) Write(p []byte) (n int, err error) {
 // go logger.StartWithWriter(ctx, kafkaWriter)
 ```
 
-### Test Helper
+### Test Helper (Deterministic, No Sleeps)
 
 ```go
 package testutil
@@ -440,13 +452,15 @@ import (
     "context"
     "strings"
     "time"
-    "uretgec/internal/loggerj"
+
+    "github.com/uretgec/loggerj"
 )
 
 type TestLogger struct {
     Logger *loggerj.Logger
     Buffer *bytes.Buffer
     cancel context.CancelFunc
+    done   chan struct{}
 }
 
 func NewTestLogger() *TestLogger {
@@ -456,16 +470,26 @@ func NewTestLogger() *TestLogger {
         FlushTimeout: 10 * time.Millisecond,
         ChannelSize:  100,
     })
+
     ctx, cancel := context.WithCancel(context.Background())
     go logger.StartWithWriter(ctx, buf)
-    
-    return &TestLogger{Logger: logger, Buffer: buf, cancel: cancel}
+
+    // Block until the worker is ready — no time.Sleep needed
+    <-logger.started
+
+    return &TestLogger{
+        Logger: logger,
+        Buffer: buf,
+        cancel: cancel,
+        done:   logger.workerDone,
+    }
 }
 
 func (t *TestLogger) Close() {
-    t.cancel()
-    time.Sleep(20 * time.Millisecond)
-    t.Logger.Close()
+    t.Logger.Flush()       // 1. Write all pending entries
+    t.cancel()             // 2. Signal worker to stop
+    <-t.done               // 3. Wait for worker to exit (deterministic)
+    t.Logger.Close()       // 4. Release file handles
 }
 
 func (t *TestLogger) Contains(s string) bool {
@@ -482,13 +506,13 @@ func (t *TestLogger) Contains(s string) bool {
 
 ```go
 logger := loggerj.NewLogger(loggerj.Config{
-    JSONOutput:   true,   // Structured for log aggregation
-    OutputFile:   "/var/log/myapp/app.log",
-    MaxFileSize:  100 * 1024 * 1024,  // 100 MB
+    JSONOutput:     true,   // Structured for log aggregation
+    OutputFile:     "/var/log/myapp/app.log",
+    MaxFileSize:    100 * 1024 * 1024,  // 100 MB
     MaxBackupFiles: 10,
-    FlushTimeout: 100 * time.Millisecond,
-    ChannelSize:  8192,
-    IncludeCaller: false, // CRITICAL: Saves ~380ns and 2 allocs per log
+    FlushTimeout:   100 * time.Millisecond,
+    ChannelSize:    8192,
+    IncludeCaller:  false, // CRITICAL: Saves ~460ns and 2 allocs per log
 })
 ```
 
@@ -496,14 +520,14 @@ logger := loggerj.NewLogger(loggerj.Config{
 
 ```go
 logger := loggerj.NewLogger(loggerj.Config{
-    JSONOutput:   false,  // Text is faster and smaller
-    OutputFile:   "/var/log/myapp/app.log",
-    FlushTimeout: 100 * time.Millisecond,
-    ChannelSize:  1024,
+    JSONOutput:       false,  // Text is faster and smaller
+    OutputFile:       "/var/log/myapp/app.log",
+    FlushTimeout:     100 * time.Millisecond,
+    ChannelSize:      1024,
     WorkerBufferSize: 2048,
     FlushThreshold:   2048,
     WriterBufferSize: 4096,
-    IncludeCaller: false,
+    IncludeCaller:    false,
 })
 ```
 
@@ -511,14 +535,14 @@ logger := loggerj.NewLogger(loggerj.Config{
 
 ```go
 logger := loggerj.NewLogger(loggerj.Config{
-    JSONOutput:   true,
-    OutputFile:   "/var/log/myapp/app.log",
+    JSONOutput:       true,
+    OutputFile:       "/var/log/myapp/app.log",
     FlushTimeout:     500 * time.Millisecond,  // Batch more
     ChannelSize:      65536,                   // Huge buffer for spikes
     WorkerBufferSize: 16384,
     FlushThreshold:   16384,
     WriterBufferSize: 32768,
-    IncludeCaller: false,
+    IncludeCaller:    false,
 })
 ```
 
@@ -572,49 +596,50 @@ func (p *WorkerPool) Start(ctx context.Context) {
 
 ### Standard Library Integration (Intercepting `std log`)
 
-`loggerj` provides an `io.Writer` adapter that allows you to intercept logs from Go's standard `log` package and third-party libraries that rely on it. This ensures that *all* application logs flow through `loggerj`'s high-performance, asynchronous pipeline, benefiting from log rotation, structured formatting, and drop monitoring.
+`loggerj` provides an `io.Writer` adapter that allows you to intercept logs from Go's standard `log` package and third-party libraries that rely on it. This ensures that all application logs flow through `loggerj`'s high-performance, asynchronous pipeline, benefiting from log rotation, structured formatting, and drop monitoring.
 
 ```go
 package main
 
 import (
- "context"
- "log"
- "time"
- "github.com/uretgec/loggerj"
+    "context"
+    "log"
+    "time"
+
+    "github.com/uretgec/loggerj"
 )
 
 func main() {
- // 1. Initialize loggerj
- logger := loggerj.NewLogger(loggerj.Config{
-  JSONOutput:   true,
-  FlushTimeout: 50 * time.Millisecond,
- })
+    // 1. Initialize loggerj
+    logger := loggerj.NewLogger(loggerj.Config{
+        JSONOutput:   true,
+        FlushTimeout: 50 * time.Millisecond,
+    })
 
- ctx, cancel := context.WithCancel(context.Background())
- defer cancel()
- go logger.Start(ctx)
- defer logger.Close()
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+    go logger.Start(ctx)
+    defer logger.Close()
 
- // 2. Redirect standard log to loggerj
- // CRITICAL: Disable std log's default flags (date/time) to avoid duplicate timestamps,
- // as loggerj already adds its own high-precision timestamp.
- log.SetFlags(0)
- log.SetOutput(logger.AsWriter(loggerj.LevelInfo, "STDLIB"))
+    // 2. Redirect standard log to loggerj
+    // CRITICAL: Disable std log's default flags (date/time) to avoid duplicate
+    // timestamps, as loggerj already adds its own high-precision timestamp.
+    log.SetFlags(0)
+    log.SetOutput(logger.AsWriter(loggerj.LevelInfo, "STDLIB"))
 
- // 3. Usage
- // These messages will now be formatted as JSON and processed asynchronously by loggerj.
- log.Println("This is a standard log message intercepted by loggerj.")
- log.Printf("User %s logged in from %s", "admin", "192.168.1.50")
+    // 3. Usage
+    // These messages will now be formatted as JSON and processed asynchronously.
+    log.Println("This is a standard log message intercepted by loggerj.")
+    log.Printf("User %s logged in from %s", "admin", "192.168.1.50")
 
- // You can still use loggerj's native API alongside std log
- logger.InfoString("APP", "Application logic running")
+    // You can still use loggerj's native API alongside std log
+    logger.InfoString("APP", "Application logic running")
 
- logger.Flush()
+    logger.Flush()
 }
 ```
 
--> Output Example
+#### Output Example
 
 When using `JSONOutput: true`, intercepted standard logs will appear as:
 
@@ -624,7 +649,7 @@ When using `JSONOutput: true`, intercepted standard logs will appear as:
 {"ts":1704067200789,"level":"INFO","type":"APP","msg":"Application logic running"}
 ```
 
--> Performance Note
+#### Performance Note
 
 While `loggerj`'s core hot path is strictly zero-allocation, the `AsWriter` adapter incurs a minor allocation (`string(p)`) to convert the `[]byte` input from `std log` into a string. This is acceptable for intercepting legacy or third-party logs but should not be used for the application's primary high-throughput logging path. For maximum performance, prefer `logger.InfoString` or `logger.Info` directly.
 
@@ -639,11 +664,12 @@ logger := loggerj.NewLogger(loggerj.Config{
     IncludeCaller: true,  // Adds file:line to logs
     FlushTimeout:  50 * time.Millisecond,
 })
+
 // Output: [1704067200123] INFO [DEBUG] main.go:42 detailed info
-// WARNING: Adds ~500ns and 2 allocations per log. Disable in production.
+// WARNING: Adds ~460ns and 2 allocations per log. Disable in production.
 ```
 
-### Drop Monitoring
+### Drop Monitoring (Polling)
 
 ```go
 go func() {
@@ -652,11 +678,27 @@ go func() {
     for range ticker.C {
         drops := logger.Drops()
         if drops > 0 {
-            fmt.Fprintf(os.Stderr, "⚠️ WARNING: %d logs dropped in last 5s\n", drops)
+            fmt.Fprintf(os.Stderr, "WARNING: %d logs dropped in last 5s\n", drops)
             logger.ResetDrops()
         }
     }
 }()
+```
+
+### Drop Monitoring (Callback — Real-Time)
+
+```go
+// SetOnDrop registers a callback invoked on every drop event.
+// WARNING: Called from the hot path — keep it fast (atomic ops only).
+logger.SetOnDrop(func(totalDropped uint64) {
+    // Example: increment a Prometheus counter
+    logsDropped.Inc()
+
+    // Example: log to stderr every 1000 drops
+    if totalDropped%1000 == 0 {
+        fmt.Fprintf(os.Stderr, "WARNING: %d total logs dropped\n", totalDropped)
+    }
+})
 ```
 
 ### Flush on Signal
@@ -664,12 +706,14 @@ go func() {
 ```go
 sigCh := make(chan os.Signal, 1)
 signal.Notify(sigCh, syscall.SIGUSR1)
+
 go func() {
     for range sigCh {
         logger.InfoString("SIGNAL", "Received SIGUSR1, flushing logs")
         logger.Flush()
     }
 }()
+
 // Usage: kill -USR1 <pid>
 ```
 
@@ -680,12 +724,73 @@ go func() {
 Fine-tune buffer sizes for your specific workload:
 
 | Parameter | Low Memory | Balanced (Default) | High Performance |
-|-----------|------------|--------------------|------------------|
-| `ChannelSize` | 512-1024 | 4096 | 16384-65536 |
-| `WorkerBufferSize` | 1024-2048 | 4096 | 8192-16384 |
-| `FlushThreshold` | 1024-2048 | 4096 | 8192-16384 |
-| `WriterBufferSize` | 2048-4096 | 8192 | 16384-32768 |
-| `FlushTimeout` | 100ms | 50ms | 10-25ms |
+|-----------|-----------|-------------------|-----------------|
+| ChannelSize | 512-1024 | 4096 | 16384-65536 |
+| WorkerBufferSize | 1024-2048 | 4096 | 8192-16384 |
+| FlushThreshold | 1024-2048 | 4096 | 8192-16384 |
+| WriterBufferSize | 2048-4096 | 8192 | 16384-32768 |
+| FlushTimeout | 100ms | 50ms | 10-25ms |
+
+---
+
+## 16. Context Integration
+
+`loggerj` provides opt-in context-aware logging methods (`InfoCtx`, `DebugCtx`, `WarnCtx`, `ErrorCtx`) that extract known keys from `context.Context`. When unused, there is **zero overhead** — the methods behave identically to their non-context counterparts.
+
+### Available Context Keys
+
+| Key | Field Name | Use Case |
+|-----|-----------|----------|
+| `loggerj.TraceIDKey` | `trace_id` | Distributed tracing (Jaeger, Zipkin, OTel) |
+| `loggerj.RequestIDKey` | `request_id` | HTTP request correlation |
+| `loggerj.SpanIDKey` | `span_id` | Span-level tracing |
+
+### Basic Usage
+
+```go
+// In your HTTP middleware, inject trace/request IDs into the context:
+func tracingMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        ctx := r.Context()
+        ctx = context.WithValue(ctx, loggerj.TraceIDKey, r.Header.Get("X-Trace-ID"))
+        ctx = context.WithValue(ctx, loggerj.RequestIDKey, r.Header.Get("X-Request-ID"))
+        next.ServeHTTP(w, r.WithContext(ctx))
+    })
+}
+
+// In your handlers, use the Ctx methods:
+func handleRequest(logger *loggerj.Logger, ctx context.Context) {
+    logger.InfoCtx(ctx, "HTTP", "processing request", "method", "GET", "path", "/api")
+    // Output includes: "trace_id":"abc-123","request_id":"req-456"
+}
+```
+
+### Nil Context Safety
+
+```go
+// Passing nil is safe — behaves exactly like InfoString
+logger.InfoCtx(nil, "HTTP", "no context available")
+// Output: {"ts":...,"level":"INFO","type":"HTTP","msg":"no context available"}
+// No trace_id, request_id, or span_id fields added.
+```
+
+### Custom Context Keys
+
+For application-specific context values, extract them in your middleware and pass as standard fields:
+
+```go
+// Extract custom values in middleware, pass as fields (zero-cost)
+userID := ctx.Value("user_id").(string)
+logger.InfoString("HTTP", "request", "user_id", userID, "method", "GET")
+```
+
+### Performance
+
+| Method | ns/op | allocs/op | Notes |
+|--------|-------|-----------|-------|
+| `InfoString` (no ctx) | ~63 | 0 | Baseline |
+| `InfoCtx` (nil ctx) | ~63 | 0 | Identical to InfoString |
+| `InfoCtx` (with values) | ~63 + N×ctx.Value | 0-1 | N = number of known keys found |
 
 ---
 
@@ -695,6 +800,8 @@ These examples demonstrate the core philosophy of `loggerj` v2:
 
 1. **Define rules once** using `RegisterSub` (Cold Path).
 2. **Log cleanly and rapidly** using `InfoString`/`ErrorString` (Hot Path).
-3. **Achieve true zero-allocation** and lock-free concurrency.
+3. **Use context-aware methods** (`InfoCtx`/`ErrorCtx`) for distributed tracing (Opt-in).
+4. **Monitor drops** via `SetOnDrop` callback or `Drops()` polling.
+5. **Achieve true zero-allocation** and lock-free concurrency.
 
 For detailed performance metrics, see [BENCH.md](BENCH.md). For API reference, see [README.md](README.md).

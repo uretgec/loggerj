@@ -70,13 +70,13 @@ package loggerj
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"os"
 	"runtime"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -223,11 +223,14 @@ type SubProfile struct {
 	textPrefix []byte // e.g., "module=HTTP env=prod "
 	jsonPrefix []byte // e.g., ,"module":"HTTP","env":"prod"
 
-	// Lock-Free Rate Limiting (CAS)
-	rlLimit   int64        // Max logs per window (0 = unlimited)
-	rlWindow  int64        // Window size in seconds
-	rlCount   atomic.Int64 // Current count in window
-	rlResetAt atomic.Int64 // Unix timestamp when window resets
+	// Lock-Free Rate Limiting (single-word CAS)
+	// rlState packs the window index (upper 32 bits) and the in-window count
+	// (lower 32 bits) into one atomic.Uint64. This makes the "reset-then-increment"
+	// operation linearizable in a single Compare-And-Swap, closing the race window
+	// that existed between rlResetAt.CompareAndSwap and rlCount.Store.
+	rlLimit    int64         // Max logs per window (0 = unlimited)
+	rlWindowMs int64         // Window size in milliseconds (supports sub-second)
+	rlState    atomic.Uint64 // packed: (windowIdx << 32) | count
 
 	// Lock-Free Sampling
 	sampleRate  int64        // Log 1 out of N (0 = no sampling)
@@ -243,11 +246,17 @@ type SubProfile struct {
 type SubOption func(*SubProfile)
 
 // WithRateLimit sets a lock-free rate limit for this specific logType.
-// limit is the max logs per window. window is the duration (e.g., time.Second).
+// limit is the max logs per window. window is the duration (e.g., time.Second,
+// 500 * time.Millisecond). Sub-second windows are fully supported; unlike the
+// previous second-granular implementation, a 500ms window no longer silently
+// becomes 1s.
 func WithRateLimit(limit int64, window time.Duration) SubOption {
 	return func(p *SubProfile) {
 		p.rlLimit = limit
-		p.rlWindow = int64(window.Seconds())
+		p.rlWindowMs = window.Milliseconds()
+		if p.rlWindowMs < 1 {
+			p.rlWindowMs = 1
+		}
 	}
 }
 
@@ -355,12 +364,24 @@ type Logger struct {
 	// started is closed when the worker goroutine begins processing.
 	// workerDone is closed when the worker goroutine exits.
 	startOnce  sync.Once
+	closeOnce  sync.Once // Protects workerDone from double-close panics
 	started    chan struct{}
 	workerDone chan struct{}
 
+	// running tracks whether the worker goroutine is currently active.
+	// Prevents double-start panics and allows Flush() to bypass the worker
+	// channel synchronization when no worker is running.
+	running atomic.Bool
+
+	// flushMu serializes Flush() calls. Flush is a cold-path operation,
+	// so a mutex is acceptable and eliminates the need for complex
+	// non-blocking channel selects and retry sleeps.
+	flushMu sync.Mutex
+
 	// onDrop is an optional callback invoked when logs are dropped
-	// due to a full channel. Called from the hot path — keep it fast.
-	onDrop func(dropped uint64)
+	// due to a full channel. Called from the drop-path (not the happy path).
+	// Uses atomic.Pointer to allow concurrent SetOnDrop calls without data races.
+	onDrop atomic.Pointer[func(dropped uint64)]
 }
 
 // NewLogger creates a new Logger instance. The logger is not started;
@@ -430,20 +451,27 @@ func (l *Logger) RegisterSub(logType string, opts ...SubOption) {
 	// Release raw fields immediately after baking
 	p.tempFields = nil
 
-	// Initialize rate limit window
+	// Initialize rate limit window. WithRateLimit sets rlWindowMs directly;
+	// if the caller did not use WithRateLimit but rlLimit is somehow > 0,
+	// fall back to Config.RateLimitWindow (seconds → ms). rlState starts at
+	// zero; the first checkAtomicRateLimit call naturally seeds the window.
 	if p.rlLimit > 0 {
-		if p.rlWindow == 0 {
-			p.rlWindow = l.cfg.RateLimitWindow
+		if p.rlWindowMs <= 0 {
+			p.rlWindowMs = l.cfg.RateLimitWindow * 1000
 		}
-		p.rlResetAt.Store(time.Now().Unix() + p.rlWindow)
+		if p.rlWindowMs < 1 {
+			p.rlWindowMs = 1000
+		}
 	}
 
-	// Copy-on-write: clone the current registry, append the new profile,
-	// and swap atomically. Hot-path readers see either the old or the new
-	// snapshot — never a partially updated state.
+	// Copy-on-write: clone the current registry, append the new profile
+	// (or replace an existing one with the same name), and swap atomically.
+	// Hot-path readers see either the old or the new snapshot — never a
+	// partially updated state. Replacing on duplicate prevents silent
+	// configuration errors where a second RegisterSub call is ignored
+	// because getProfile() returns the first match in a linear scan.
 	l.registerMu.Lock()
 	defer l.registerMu.Unlock()
-
 	old := l.registry.Load()
 	var newReg *profileRegistry
 	if old == nil {
@@ -453,15 +481,39 @@ func (l *Logger) RegisterSub(logType string, opts ...SubOption) {
 		}
 	} else {
 		n := len(old.names)
-		newNames := make([]string, n+1)
-		newProfiles := make([]*SubProfile, n+1)
-		copy(newNames, old.names)
-		copy(newProfiles, old.profiles)
-		newNames[n] = logType
-		newProfiles[n] = p
-		newReg = &profileRegistry{
-			names:    newNames,
-			profiles: newProfiles,
+		// Check for existing profile with the same name
+		replaceIdx := -1
+		for i := 0; i < n; i++ {
+			if old.names[i] == logType {
+				replaceIdx = i
+				break
+			}
+		}
+
+		if replaceIdx >= 0 {
+			// Replace existing profile (same size, just swap the pointer)
+			newNames := make([]string, n)
+			newProfiles := make([]*SubProfile, n)
+			copy(newNames, old.names)
+			copy(newProfiles, old.profiles)
+			newNames[replaceIdx] = logType
+			newProfiles[replaceIdx] = p
+			newReg = &profileRegistry{
+				names:    newNames,
+				profiles: newProfiles,
+			}
+		} else {
+			// Append new profile
+			newNames := make([]string, n+1)
+			newProfiles := make([]*SubProfile, n+1)
+			copy(newNames, old.names)
+			copy(newProfiles, old.profiles)
+			newNames[n] = logType
+			newProfiles[n] = p
+			newReg = &profileRegistry{
+				names:    newNames,
+				profiles: newProfiles,
+			}
 		}
 	}
 	l.registry.Store(newReg)
@@ -715,30 +767,52 @@ func (l *Logger) log(level Level, logType string, msg []byte, skip int, fields .
 	default:
 		// Channel full: drop the entry and increment the counter
 		l.drops.Add(1)
-		if l.onDrop != nil {
-			l.onDrop(l.drops.Load())
+		if fn := l.onDrop.Load(); fn != nil {
+			(*fn)(l.drops.Load())
 		}
 		e.Reset()
 		l.pool.Put(e)
 	}
 }
 
-// checkAtomicRateLimit performs lock-free rate limiting using Compare-And-Swap.
-// On window expiry, the counter is reset to 0 via CAS, then every goroutine
-// (including the one that won the CAS) increments via Add(1). This ensures
-// a single atomic increment point, eliminating the race window that existed
-// when Store(1) and Add(1) were used as separate paths.
+// checkAtomicRateLimit performs lock-free rate limiting with a single
+// linearizable Compare-And-Swap. The window index and in-window count are
+// packed into one atomic.Uint64, so a window transition and the corresponding
+// counter reset happen atomically. Under contention, losing goroutines simply
+// retry with the freshly-published state — no separate Store(0) step exists,
+// eliminating the race where a goroutine could observe an old counter value
+// between the winner's CAS and its Store(0).
+//
+//go:nosplit
 func (l *Logger) checkAtomicRateLimit(p *SubProfile) bool {
-	now := time.Now().Unix()
-	resetTime := p.rlResetAt.Load()
-	if now >= resetTime {
-		if p.rlResetAt.CompareAndSwap(resetTime, now+p.rlWindow) {
-			p.rlCount.Store(0)
-		}
-		// CAS failure means another goroutine already reset the window;
-		// fall through to the shared increment path.
+	nowMs := time.Now().UnixMilli()
+	windowMs := p.rlWindowMs
+	if windowMs <= 0 {
+		windowMs = 1000
 	}
-	return p.rlCount.Add(1) <= p.rlLimit
+	nowWin := uint64(nowMs / windowMs)
+	limit := uint64(p.rlLimit)
+	for {
+		state := p.rlState.Load()
+		win := state >> 32
+		cnt := state & 0xFFFFFFFF
+		var newCnt, next uint64
+		if win != nowWin {
+			// New window: reset counter to 1 (this goroutine is the first).
+			newCnt = 1
+			next = (nowWin << 32) | 1
+		} else {
+			// Same window: increment counter.
+			newCnt = cnt + 1
+			next = state + 1
+		}
+		if p.rlState.CompareAndSwap(state, next) {
+			return newCnt <= limit
+		}
+		// CAS failed: another goroutine updated state first; retry with
+		// the freshly-published value. Bounded by the number of concurrent
+		// goroutines hitting this exact nanosecond.
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -768,14 +842,27 @@ func (l *Logger) Start(ctx context.Context) {
 // The Flush() method drains all pending channel entries before writing,
 // guaranteeing no log loss on explicit flush.
 func (l *Logger) StartWithWriter(ctx context.Context, w io.Writer) {
+	// Prevent double-start panics and concurrent starts.
+	// If the worker is already running (or has run and exited), this
+	// call becomes a safe no-op.
+	if !l.running.CompareAndSwap(false, true) {
+		return
+	}
+
 	l.globalWriterMu.Lock()
 	l.globalWriter = w
 	l.globalWriterMu.Unlock()
 
 	// Signal that the worker has started (first call only, thread-safe)
 	l.startOnce.Do(func() { close(l.started) })
-	// Signal that the worker has exited when this function returns
-	defer close(l.workerDone)
+
+	// Signal that the worker has exited when this function returns.
+	// closeOnce ensures that if Start() is called again after the worker
+	// exits, we don't panic on "close of closed channel".
+	defer func() {
+		l.running.Store(false)
+		l.closeOnce.Do(func() { close(l.workerDone) })
+	}()
 
 	bw, ok := w.(*bufio.Writer)
 	if !ok {
@@ -802,20 +889,17 @@ workerLoop:
 			buf = l.formatEntry(buf, e)
 			e.Reset()
 			l.pool.Put(e)
-
 			if len(buf) >= flushThreshold {
-				written := len(buf)
-				if _, err := bw.Write(buf); err != nil {
-					fmt.Fprintf(os.Stderr, "loggerj: write error: %v\n", err)
-				}
-				if err := bw.Flush(); err != nil {
-					fmt.Fprintf(os.Stderr, "loggerj: flush error: %v\n", err)
-				}
+				l.writeOut(bw, buf)
 				buf = buf[:0]
 				if l.cfg.OutputFile != "" {
-					l.currentSize += int64(written)
-					if err := l.rotateLogFile(); err != nil {
+					if rotated, err := l.rotateLogFile(); err != nil {
 						fmt.Fprintf(os.Stderr, "loggerj: rotation error: %v\n", err)
+					} else if rotated {
+						// CRITICAL: Refresh the writer handle after rotation.
+						// The old bw points to a closed file; l.currentWriter
+						// is the fresh handle opened by rotateLogFile.
+						bw = l.currentWriter
 					}
 				}
 			}
@@ -823,13 +907,16 @@ workerLoop:
 		// ── Periodic flush ──
 		case <-ticker.C:
 			if len(buf) > 0 {
-				if _, err := bw.Write(buf); err != nil {
-					fmt.Fprintf(os.Stderr, "loggerj: write error: %v\n", err)
-				}
-				if err := bw.Flush(); err != nil {
-					fmt.Fprintf(os.Stderr, "loggerj: flush error: %v\n", err)
-				}
+				l.writeOut(bw, buf)
 				buf = buf[:0]
+				// Optional: check rotation on ticker as well (safety net)
+				if l.cfg.OutputFile != "" {
+					if rotated, err := l.rotateLogFile(); err != nil {
+						fmt.Fprintf(os.Stderr, "loggerj: rotation error: %v\n", err)
+					} else if rotated {
+						bw = l.currentWriter
+					}
+				}
 			}
 
 		// ── Explicit Flush() call ──
@@ -845,12 +932,7 @@ workerLoop:
 				default:
 					// Channel empty — write and flush the buffer
 					if len(buf) > 0 {
-						if _, err := bw.Write(buf); err != nil {
-							fmt.Fprintf(os.Stderr, "loggerj: write error: %v\n", err)
-						}
-						if err := bw.Flush(); err != nil {
-							fmt.Fprintf(os.Stderr, "loggerj: flush error: %v\n", err)
-						}
+						l.writeOut(bw, buf)
 						buf = buf[:0]
 					}
 					close(done)
@@ -859,6 +941,27 @@ workerLoop:
 			}
 		}
 	}
+}
+
+// writeOut writes the buffer to the underlying writer, flushes it, and
+// updates currentSize. Centralizes all I/O paths (threshold, ticker,
+// explicit-flush, drain) to ensure currentSize is always accurate.
+// Returns the number of bytes written.
+func (l *Logger) writeOut(bw *bufio.Writer, buf []byte) int {
+	if len(buf) == 0 {
+		return 0
+	}
+	written := len(buf)
+	if _, err := bw.Write(buf); err != nil {
+		fmt.Fprintf(os.Stderr, "loggerj: write error: %v\n", err)
+	}
+	if err := bw.Flush(); err != nil {
+		fmt.Fprintf(os.Stderr, "loggerj: flush error: %v\n", err)
+	}
+	if l.cfg.OutputFile != "" {
+		l.currentSize += int64(written)
+	}
+	return written
 }
 
 // -----------------------------------------------------------------------------
@@ -1089,12 +1192,13 @@ func (l *Logger) openLogFile() error {
 	return nil
 }
 
-// rotateLogFile performs size-based log rotation. When the current file
-// exceeds MaxFileSize, it is renamed with a numeric suffix (.1, .2, ...)
-// and a new file is created. Old backups beyond MaxBackupFiles are removed.
-func (l *Logger) rotateLogFile() error {
+// rotateLogFile performs size-based log rotation. Returns (true, nil) if
+// rotation occurred, (false, nil) if no rotation needed, or (false, err)
+// on failure. The caller must refresh its bufio.Writer handle after a
+// successful rotation to avoid writing to a closed file.
+func (l *Logger) rotateLogFile() (rotated bool, err error) {
 	if l.cfg.MaxFileSize <= 0 || l.currentSize < l.cfg.MaxFileSize {
-		return nil
+		return false, nil
 	}
 
 	l.rotationMu.Lock()
@@ -1136,12 +1240,12 @@ func (l *Logger) rotateLogFile() error {
 	// Create a fresh log file
 	f, err := os.OpenFile(l.outputFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to open new log file: %w", err)
+		return false, fmt.Errorf("failed to open new log file: %w", err)
 	}
 	stat, err := f.Stat()
 	if err != nil {
 		f.Close()
-		return fmt.Errorf("failed to stat new log file: %w", err)
+		return false, fmt.Errorf("failed to stat new log file: %w", err)
 	}
 
 	l.currentFile = f
@@ -1151,7 +1255,9 @@ func (l *Logger) rotateLogFile() error {
 	l.globalWriterMu.Lock()
 	l.globalWriter = l.currentWriter
 	l.globalWriterMu.Unlock()
-	return nil
+
+	// At the end, before returning:
+	return true, nil
 }
 
 // -----------------------------------------------------------------------------
@@ -1169,12 +1275,8 @@ func (l *Logger) drainAndFlush(bw *bufio.Writer, buf []byte) {
 			l.pool.Put(e)
 		default:
 			if len(buf) > 0 {
-				if _, err := bw.Write(buf); err != nil {
-					fmt.Fprintf(os.Stderr, "loggerj: write error during drain: %v\n", err)
-				}
-				if err := bw.Flush(); err != nil {
-					fmt.Fprintf(os.Stderr, "loggerj: flush error during drain: %v\n", err)
-				}
+				l.writeOut(bw, buf)
+				// No need to refresh bw here; worker is exiting.
 			}
 			return
 		}
@@ -1185,15 +1287,18 @@ func (l *Logger) drainAndFlush(bw *bufio.Writer, buf []byte) {
 // the worker to drain the channel and write the buffer, then blocks until
 // the worker confirms completion (or times out after 1 second).
 //
-// If no worker is running (globalWriter is nil), Flush drains and discards
-// all pending entries to prevent channel blockage.
+// If no worker is running, Flush drains and discards all pending entries
+// to prevent channel blockage. This also fixes the 1-second block that
+// occurred when OutputFile was set but Start() hadn't been called yet.
 func (l *Logger) Flush() {
-	l.globalWriterMu.Lock()
-	w := l.globalWriter
-	l.globalWriterMu.Unlock()
+	l.flushMu.Lock()
+	defer l.flushMu.Unlock()
 
-	if w == nil {
-		// No worker running: drain and discard to prevent blockage
+	// If the worker is not running, drain the channel and discard entries.
+	// This is critical for OutputFile configurations where globalWriter
+	// is set during NewLogger, which previously caused Flush() to block
+	// for 1 second waiting for a non-existent worker.
+	if !l.running.Load() {
 		for {
 			select {
 			case e := <-l.logCh:
@@ -1206,24 +1311,18 @@ func (l *Logger) Flush() {
 	}
 
 	done := make(chan struct{})
+	// flushCh has capacity 1. Since we hold flushMu, it is guaranteed
+	// to be empty, so this send will never block.
+	l.flushCh <- done
+
+	// Use time.NewTimer instead of time.After to prevent timer leaks
+	// when the worker responds quickly.
+	timer := time.NewTimer(1 * time.Second)
+	defer timer.Stop()
+
 	select {
-	case l.flushCh <- done:
-		select {
-		case <-done:
-		case <-time.After(1 * time.Second):
-		}
-	default:
-		// flushCh full (another Flush in progress): brief retry
-		time.Sleep(time.Millisecond)
-		select {
-		case l.flushCh <- done:
-			select {
-			case <-done:
-			case <-time.After(1 * time.Second):
-			}
-		default:
-			return
-		}
+	case <-done:
+	case <-timer.C:
 	}
 }
 
@@ -1257,21 +1356,36 @@ func (l *Logger) ResetDrops() {
 }
 
 // SetOnDrop registers a callback invoked whenever a log entry is dropped
-// due to a full channel. The callback receives the current total drop count.
-//
-// WARNING: This callback is invoked from the hot path. Keep it fast
-// (e.g., atomic counter increment, metrics gauge update). Never perform
-// I/O or acquire locks inside this callback.
+// due to a full channel. Thread-safe; can be called concurrently with logging.
+// Pass nil to unregister the callback.
 func (l *Logger) SetOnDrop(fn func(dropped uint64)) {
-	l.onDrop = fn
+	if fn == nil {
+		l.onDrop.Store(nil)
+		return
+	}
+	// Copy the function value to a local variable and store its pointer.
+	// This causes 1 heap allocation, but SetOnDrop is a cold-path operation
+	// (usually called once at startup), so this is perfectly acceptable.
+	f := fn
+	l.onDrop.Store(&f)
+}
+
+// Stats represents a snapshot of logger statistics. Using a struct
+// instead of a map avoids heap allocations on every call, which is
+// important for observability loops (e.g., Prometheus exporters) that
+// poll Stats() frequently.
+type Stats struct {
+	Drops       uint64
+	ChannelSize uint64
+	ChannelCap  uint64
 }
 
 // Stats returns a snapshot of logger statistics.
-func (l *Logger) Stats() map[string]uint64 {
-	return map[string]uint64{
-		"drops":        l.drops.Load(),
-		"channel_size": uint64(len(l.logCh)),
-		"channel_cap":  uint64(cap(l.logCh)),
+func (l *Logger) Stats() Stats {
+	return Stats{
+		Drops:       l.drops.Load(),
+		ChannelSize: uint64(len(l.logCh)),
+		ChannelCap:  uint64(cap(l.logCh)),
 	}
 }
 
@@ -1308,9 +1422,15 @@ func (l *Logger) AsWriter(level Level, logType string) io.Writer {
 }
 
 // Write implements the io.Writer interface. Trailing newlines from
-// std log are trimmed for cleaner loggerj output.
+// std log are trimmed for cleaner loggerj output. Uses bytes.TrimRight
+// to avoid the string(p) allocation that occurred with strings.TrimRight.
+//
+// Zero-allocation guarantee: The Log() method immediately copies msg via
+// append(e.Msg[:0], msg...), so the io.Writer contract (not retaining p
+// after Write returns) is satisfied. This eliminates the only documented
+// allocation in the AsWriter adapter path.
 func (w *StdLogWriter) Write(p []byte) (int, error) {
-	msg := strings.TrimRight(string(p), "\n")
-	w.logger.Log(w.level, w.logType, unsafeStringToBytes(msg))
+	msg := bytes.TrimRight(p, "\n")
+	w.logger.Log(w.level, w.logType, msg)
 	return len(p), nil
 }

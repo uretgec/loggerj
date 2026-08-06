@@ -93,19 +93,19 @@ logger.InfoString("AUTH", "login attempt", "user", "admin")
 
 Benchmarks run on Apple M1 Pro (10 cores), Go 1.21+. `loggerj` consistently outperforms industry standards by eliminating hot-path allocations and lock contention.
 
-| Mode | ns/op | logs/s | Allocs/op | Use Case |
-|------|-------|--------|-----------|----------|
-| Filtered | 2.1 | 483M | 0 | Debug logs in production |
-| Sampling | 24 | 41M | 0 | High-volume sampled events |
-| Dropped | 19 | 53M | 0 | Channel-full backpressure |
-| RateLimited | 41 | 24M | 0 | High-volume events (Lock-Free CAS) |
-| JSON | 55 | 18M | 0 | Structured logging |
-| StringAPI | 63 | 16M | 0 | String messages (zero-copy) |
-| NoFields | 61 | 16M | 0 | Simple messages |
-| Parallel | 80 | 12.5M | 0 | Concurrent logging (10+ goroutines) |
-| SubProfile Prefix | 55 | 18M | 0 | Pre-baked static fields |
-| WithCaller | 463 | 2.2M | 2 | Debugging only |
-| SyncEquivalent | 1082 | 924K | 3 | Fair comparison with sync loggers |
+| Mode|ns/op|logs/s|Allocs/op|Use Case|
+| ---|---|---|---|---|
+| Filtered|2.1|483M|0|Debug logs in production|
+| Sampling|27|37M|0|High-volume sampled events|
+| Dropped|19|53M|0|Channel-full backpressure|
+| RateLimited|42|24M|0|High-volume events (Lock-Free CAS)|
+| JSON|53|19M|0|Structured logging|
+| StringAPI|60|17M|0|String messages (zero-copy)|
+| NoFields|71|14M|0|Simple messages|
+| Parallel|79|12.7M|0|Concurrent logging (10+ goroutines)|
+| SubProfile Prefix|59|17M|0|Pre-baked static fields|
+| WithCaller|464|2.2M|2|Debugging only|
+| SyncEquivalent|1118|894K|3-4|Fair comparison with sync loggers|
 
 > **Note**: `WithCaller` allocates due to Go's `runtime.Caller` — a fundamental limitation. `SyncEquivalent` forces `Flush()` after every log to simulate synchronous behavior; this is NOT the intended usage pattern.
 
@@ -188,6 +188,10 @@ go tool pprof -http=:8080 cpu.out
 
 - [Usage Examples](EXAMPLES.md) — Comprehensive examples for all features
 - [Benchmark Results](BENCH.md) — Detailed performance analysis
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for detailed release notes and migration guides.
 
 ## License
 

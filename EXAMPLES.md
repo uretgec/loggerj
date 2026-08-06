@@ -34,7 +34,7 @@ Comprehensive examples for all `loggerj` features, configurations, and the Pre-C
     - [Worker Pool Integration](#worker-pool-integration)
     - [Standard Library Integration (Intercepting `std log`)](#standard-library-integration-intercepting-std-log)
       - [Output Example](#output-example)
-      - [Performance Note](#performance-note)
+    - [Performance Note](#performance-note)
   - [14. Observability](#14-observability)
     - [Caller Info (Debug Only)](#caller-info-debug-only)
     - [Drop Monitoring (Polling)](#drop-monitoring-polling)
@@ -567,7 +567,7 @@ func collectLoggerMetrics(logger *loggerj.Logger) {
     defer ticker.Stop()
     for range ticker.C {
         stats := logger.Stats()
-        logsDropped.Add(float64(stats["drops"]))
+        logsDropped.Add(float64(stats.Drops))  // Stats is now a struct, not a map
     }
 }
 ```
@@ -649,9 +649,11 @@ When using `JSONOutput: true`, intercepted standard logs will appear as:
 {"ts":1704067200789,"level":"INFO","type":"APP","msg":"Application logic running"}
 ```
 
-#### Performance Note
+### Performance Note
 
-While `loggerj`'s core hot path is strictly zero-allocation, the `AsWriter` adapter incurs a minor allocation (`string(p)`) to convert the `[]byte` input from `std log` into a string. This is acceptable for intercepting legacy or third-party logs but should not be used for the application's primary high-throughput logging path. For maximum performance, prefer `logger.InfoString` or `logger.Info` directly.
+`loggerj` 's  `AsWriter`  adapter performs **zero heap allocations** per write. The implementation uses  `bytes.TrimRight(p, "\n")`  instead of  `strings.TrimRight(string(p), "\n")` , avoiding the  `string(p)`  allocation. This is safe because  `Log()`  immediately copies the message via  `append(e.Msg[:0], msg...)` , satisfying the  `io.Writer`  contract (not retaining  `p`  after  `Write`  returns).
+
+For maximum performance, prefer  `logger.InfoString`  or  `logger.Info`  directly over  `AsWriter` , as the adapter still incurs function call overhead. However,  `AsWriter`  is now allocation-free and suitable for intercepting high-volume legacy or third-party logs.
 
 ---
 

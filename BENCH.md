@@ -43,34 +43,34 @@ benchstat /tmp/bench1.txt /tmp/bench2.txt
 
 ### Core Hot-Path Benchmarks
 
-| Benchmark | ns/op | logs/s | B/op | allocs/op | Description |
-|-----------|-------|--------|------|-----------|-------------|
-| **Filtered** | **2.07** | **483M** | 0 | 0 | Below-level discard (atomic load only) |
-| **Sampling** | **24** | **41M** | 0 | 0 | Lock-free atomic sampling (1/10) |
-| **Dropped** | **18.9** | **53M** | 0 | 0 | Channel-full backpressure path |
-| **RateLimited** | **41** | **24M** | 0 | 0 | Lock-free CAS rate limiting |
-| **JSON_NoEscape** | **53** | **19M** | 0 | 0 | JSON, no special characters |
-| **JSON_WithEscape** | **52** | **19M** | 0 | 0 | JSON, with quotes/backslashes |
-| **SubProfile_Prefix** | **55** | **18M** | 0 | 0 | Pre-baked prefix + 1 dynamic field |
-| **JSON** | **55** | **18M** | 0 | 0 | JSON with 2 key-value fields |
-| **NoFields** | **61** | **16M** | 0 | 0 | Simplest possible log call |
-| **StringAPI** | **63** | **16M** | 0 | 0 | String message (zero-copy unsafe) |
-| **LongMessage** | **62** | **16M** | 0 | 0 | ~230 byte message |
-| **ManyFields** | **74** | **13.5M** | 0 | 0 | 8 key-value fields (16 strings) |
-| **WithFields** | **61** | **16M** | 0 | 0 | 2 key-value fields |
-| **Parallel** | **80** | **12.5M** | 0 | 0 | 10 goroutines concurrent |
-| **LevelHelpers** | **80** | **12.5M** | 0 | 0 | `logger.Info()` helper, parallel |
-| **LargeBuffer** | **61** | **16M** | 0 | 0 | 16KB worker buffer |
-| **SmallBuffer** | **58** | **17M** | 0 | 0 | 1KB worker buffer |
+| Benchmark|ns/op|logs/s|B/op|allocs/op|Description|
+| ---|---|---|---|---|---|
+| Filtered|2.07|483M|0|0|Below-level discard (atomic load only)|
+| Sampling|27|37M|0|0|Lock-free atomic sampling (1/10)|
+| Dropped|18.9|53M|0|0|Channel-full backpressure path|
+| RateLimited|42|24M|0|0|Lock-free CAS rate limiting (packed state)|
+| JSON_NoEscape|64|16M|0|0|JSON, no special characters|
+| JSON_WithEscape|56|18M|0|0|JSON, with quotes/backslashes|
+| SubProfile_Prefix|59|17M|0|0|Pre-baked prefix + 1 dynamic field|
+| JSON|53|19M|0|0|JSON with 2 key-value fields|
+| NoFields|71|14M|0|0|Simplest possible log call|
+| StringAPI|60|17M|0|0|String message (zero-copy unsafe)|
+| LongMessage|65|15M|0|0|~230 byte message|
+| ManyFields|68|15M|0|0|8 key-value fields (16 strings)|
+| WithFields|66|15M|0|0|2 key-value fields|
+| Parallel|79|12.7M|0|0|10 goroutines concurrent|
+| LevelHelpers|81|12M|0|0|logger.Info()  helper, parallel|
+| LargeBuffer|63|16M|0|0|16KB worker buffer|
+| SmallBuffer|62|16M|0|0|1KB worker buffer|
 
 ### Expected-Allocation Benchmarks
 
-| Benchmark | ns/op | logs/s | B/op | allocs/op | Reason |
-|-----------|-------|--------|------|-----------|--------|
-| **WithCaller** | **463** | **2.2M** | 250 | 2 | `runtime.Caller` — Go limitation |
-| **VeryLongMessage** | **1500** | **667K** | 10265 | 1 | 10KB msg > Reset threshold → re-alloc |
-| **SyncEquivalent** | **1082** | **924K** | ~390 | 3 | Forced `Flush()` per log (not intended usage) |
-| **HighContention** | **116** | **8.6M** | 0-2 | 0 | CAS contention under parallel load |
+| Benchmark|ns/op|logs/s|B/op|allocs/op|Reason|
+| ---|---|---|---|---|---|
+| WithCaller|464|2.2M|250|2|runtime.Caller  — Go limitation|
+| VeryLongMessage|1500|667K|10265|1|10KB msg  > Reset threshold → re-alloc|
+| SyncEquivalent|1118|894K|~360|3-4|Forced  Flush()  per log (not intended usage)|
+| HighContention|290|3.4M|4-5|0|CAS contention under parallel load (packed-state division)|
 
 ---
 
@@ -92,41 +92,54 @@ if level < Level(l.currentLevel.Load()) {  // single atomic load
 
 One `atomic.Load` + one integer comparison + one branch. No function call overhead beyond the method dispatch itself. This is why `loggerj` can safely leave `Debug` calls in production code — they cost ~2ns when filtered.
 
-### 2. Rate Limiting — Lock-Free CAS (~41 ns/op)
+## 2. Rate Limiting — Lock-Free CAS (~42 ns/op)
 
-```txt
-BenchmarkLog_RateLimited-10    29,241,487    41.35 ns/op    0 B/op    0 allocs/op
-```
+BenchmarkLog_RateLimited-10    28,900,137    41.54 ns/op    0 B/op    0 allocs/op
 
 Traditional loggers use `sync.Mutex` + `map[string]*rateLimiter` for per-type rate limiting. This causes:
 
-- Mutex lock/unlock: ~25ns uncontended, ~200ns+ contended
-- Map lookup: ~15ns + potential allocation
-- Interface boxing: ~10ns + 1 alloc
+- **Mutex lock/unlock**: ~25ns uncontended, ~200ns+ contended
+- **Map lookup**: ~15ns + potential allocation
+- **Interface boxing**: ~10ns + 1 alloc
 
-`loggerj` eliminates all of this with a pre-compiled `SubProfile`:
+`loggerj` eliminates all of this with a pre-compiled `SubProfile` and a **packed-state CAS design**:
 
 ```go
-// Hot path: 2 atomic operations, 0 allocations
+// Hot path: single linearizable CAS, 0 allocations
+// rlState packs window index (upper 32 bits) and count (lower 32 bits)
 func (l *Logger) checkAtomicRateLimit(p *SubProfile) bool {
-    now := time.Now().Unix()
-    resetTime := p.rlResetAt.Load()       // atomic load
-    if now >= resetTime {
-        if p.rlResetAt.CompareAndSwap(resetTime, now+p.rlWindow) {
-            p.rlCount.Store(0)            // atomic store (window reset)
+    nowMs := time.Now().UnixMilli()
+    windowMs := p.rlWindowMs
+    nowWin := uint64(nowMs / windowMs)
+    limit := uint64(p.rlLimit)
+    for {
+        state := p.rlState.Load()
+        win := state >> 32
+        cnt := state & 0xFFFFFFFF
+        var newCnt, next uint64
+        if win != nowWin {
+            newCnt, next = 1, (nowWin << 32) | 1
+        } else {
+            newCnt, next = cnt+1, state+1
+        }
+        if p.rlState.CompareAndSwap(state, next) {
+            return newCnt <= limit
         }
     }
-    return p.rlCount.Add(1) <= p.rlLimit  // atomic add + compare
 }
 ```
+
+**Why packed state?** The previous design used two separate atomics (`rlCount` + `rlResetAt`), which created a race window: the goroutine that won the CAS to reset the window could be preempted before its `Store(0)`, allowing other goroutines to increment the old counter. This caused legitimate logs to be incorrectly dropped or limits to be exceeded by ~2x at window boundaries. The packed-state design makes the reset-and-increment atomic in a single CAS, eliminating this race entirely.
 
 Under high contention (10 goroutines hammering a single rate limiter):
 
 ```txt
-BenchmarkLog_RateLimited_HighContention-10    9,477,832    113.9 ns/op    0 B/op    0 allocs/op
+BenchmarkLog_RateLimited_HighContention-10    4,935,549    290.6 ns/op    4 B/op    0 allocs/op
 ```
 
-Even under extreme contention, the CAS-based approach stays at ~114ns with **zero allocations**. A mutex-based approach would degrade to 500ns+ with lock convoy effects.
+The ~290ns under extreme contention is an expected trade-off: the 64-bit division (`nowMs / windowMs`) and CAS retry loop add CPU cost compared to the old dual-atomic design (~114ns), but this is necessary for **correctness**. The old design was faster but racy. A mutex-based approach would still degrade to 500ns+ with lock convoy effects.
+
+**Sub-second windows**: The packed-state design uses `UnixMilli()` natively, so `WithRateLimit(5, 500*time.Millisecond)` works correctly without silent conversion to 1s.
 
 ### 3. Zero-Copy String API (~63 ns/op)
 

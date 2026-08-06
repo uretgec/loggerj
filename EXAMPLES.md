@@ -11,49 +11,68 @@ Comprehensive examples for all `loggerj` features, configurations, and the Pre-C
   - [3. JSON \& Text Output](#3-json--text-output)
     - [JSON Output (Recommended for Production)](#json-output-recommended-for-production)
     - [Text Output (Recommended for Development)](#text-output-recommended-for-development)
-  - [4. Multiple Loggers](#4-multiple-loggers)
-  - [5. File Logging \& Rotation](#5-file-logging--rotation)
-  - [6. Sampling \& Rate Limiting](#6-sampling--rate-limiting)
+  - [4. Typed Field API (Zero-Allocation)](#4-typed-field-api-zero-allocation)
+    - [Dynamic Values (Variables)](#dynamic-values-variables)
+    - [String Literals](#string-literals)
+    - [Error Handling](#error-handling)
+    - [HTTP Middleware Example](#http-middleware-example)
+  - [5. Multiple Loggers](#5-multiple-loggers)
+  - [6. File Logging \& Rotation](#6-file-logging--rotation)
+  - [7. Sampling \& Rate Limiting](#7-sampling--rate-limiting)
     - [Rate Limiting](#rate-limiting)
     - [Sampling](#sampling)
-  - [7. Runtime Level Change](#7-runtime-level-change)
-  - [8. Concurrent Usage \& Graceful Shutdown](#8-concurrent-usage--graceful-shutdown)
-  - [9. HTTP \& Middleware Integration](#9-http--middleware-integration)
+  - [8. Runtime Level Change](#8-runtime-level-change)
+  - [9. Concurrent Usage \& Graceful Shutdown](#9-concurrent-usage--graceful-shutdown)
+  - [10. Sync Mode (Audit Trails)](#10-sync-mode-audit-trails)
+    - [OSBuffered (Default)](#osbuffered-default)
+    - [Direct (Per-Log Guarantee)](#direct-per-log-guarantee)
+    - [FsyncEveryN (Batch Durability)](#fsynceveryn-batch-durability)
+    - [FsyncEveryWrite (Maximum Durability)](#fsynceverywrite-maximum-durability)
+    - [Durability Tier Decision Matrix](#durability-tier-decision-matrix)
+  - [11. HTTP \& Middleware Integration](#11-http--middleware-integration)
     - [Standard HTTP Middleware](#standard-http-middleware)
     - [Go Fiber Middleware](#go-fiber-middleware)
-  - [10. Error Context \& Structured Fields](#10-error-context--structured-fields)
-  - [11. Custom Writer \& Test Helper](#11-custom-writer--test-helper)
+  - [12. Error Context \& Structured Fields](#12-error-context--structured-fields)
+  - [13. Custom Writer \& Test Helper](#13-custom-writer--test-helper)
     - [Custom Writer (e.g., Kafka)](#custom-writer-eg-kafka)
     - [Test Helper (Deterministic, No Sleeps)](#test-helper-deterministic-no-sleeps)
-  - [12. Production Configurations](#12-production-configurations)
+  - [14. Production Configurations](#14-production-configurations)
     - [Standard Production Config](#standard-production-config)
     - [Low-Resource Config (e.g., 512MB RAM, 1 CPU)](#low-resource-config-eg-512mb-ram-1-cpu)
     - [High-Throughput Config](#high-throughput-config)
-  - [13. Advanced Integrations](#13-advanced-integrations)
+    - [Audit Trail Config (Sync Mode)](#audit-trail-config-sync-mode)
+  - [15. Advanced Integrations](#15-advanced-integrations)
     - [Metrics Integration (Prometheus)](#metrics-integration-prometheus)
     - [Worker Pool Integration](#worker-pool-integration)
     - [Standard Library Integration (Intercepting `std log`)](#standard-library-integration-intercepting-std-log)
       - [Output Example](#output-example)
     - [Performance Note](#performance-note)
-  - [14. Observability](#14-observability)
+  - [16. Observability](#16-observability)
     - [Caller Info (Debug Only)](#caller-info-debug-only)
     - [Drop Monitoring (Polling)](#drop-monitoring-polling)
     - [Drop Monitoring (Callback — Real-Time)](#drop-monitoring-callback--real-time)
     - [Flush on Signal](#flush-on-signal)
-  - [15. Buffer Tuning](#15-buffer-tuning)
-  - [16. Context Integration](#16-context-integration)
+    - [Sync Mode Write Error Monitoring (v1.3.1)](#sync-mode-write-error-monitoring-v131)
+  - [17. Buffer Tuning](#17-buffer-tuning)
+  - [18. Context Integration](#18-context-integration)
     - [Available Context Keys](#available-context-keys)
     - [Basic Usage](#basic-usage)
     - [Nil Context Safety](#nil-context-safety)
     - [Custom Context Keys](#custom-context-keys)
     - [Performance](#performance)
+  - [19. slog.Handler Adapter (Go 1.21+ Ecosystem Integration)](#19-sloghandler-adapter-go-121-ecosystem-integration)
+    - [Basic Usage](#basic-usage-1)
+    - [WithAttrs and WithGroup](#withattrs-and-withgroup)
+    - [Setting as Default slog Logger](#setting-as-default-slog-logger)
+    - [Performance Note](#performance-note-1)
+    - [Limitations](#limitations)
   - [Summary](#summary)
 
 ---
 
 ## 1. The SubProfile Paradigm (CRITICAL)
 
-In `loggerj` v1, rate limiting, sampling, and static fields are no longer passed during the log call. Instead, they are defined once at startup using `RegisterSub`. This "Pre-Compiled" approach is the secret to our lock-free, zero-allocation hot path.
+In `loggerj`, rate limiting, sampling, and static fields are no longer passed during the log call. Instead, they are defined once at startup using `RegisterSub`. This "Pre-Compiled" approach is the secret to our lock-free, zero-allocation hot path.
 
 ```go
 package main
@@ -169,7 +188,111 @@ Output:
 
 ---
 
-## 4. Multiple Loggers
+## 4. Typed Field API (Zero-Allocation)
+
+`loggerj` provides a typed field API similar to `zap.Field`, but with **zero caller-side allocations** even for dynamic values. The `Field` struct is 48 bytes, passed by value, with `Num uint64` holding int64/uint64/float64-bits/duration-ns/bool as a tagged union.
+
+### Dynamic Values (Variables)
+
+When logging dynamic values (variables, not string literals), typed fields avoid `strconv.Itoa` / `fmt.Sprintf` allocations:
+
+```go
+logger := loggerj.NewLogger(loggerj.Config{
+    JSONOutput:   true,
+    FlushTimeout: 50 * time.Millisecond,
+})
+// ... start worker ...
+
+// Dynamic values (variables)
+status := 200
+latency := 150 * time.Millisecond
+cached := true
+userID := int64(12345)
+
+logger.InfoFields("HTTP", []byte("request completed"),
+    loggerj.Int("status", status),           // 0 allocs
+    loggerj.Dur("latency", latency),         // 0 allocs
+    loggerj.Bool("cached", cached),          // 0 allocs
+    loggerj.Int64("user_id", userID),        // 0 allocs
+    loggerj.Str("method", "GET"),            // 0 allocs
+)
+```
+
+Output:
+
+```json
+{"ts":1704067200123,"level":"INFO","type":"HTTP","msg":"request completed","fields":{"status":200,"latency":"150ms","cached":true,"user_id":12345,"method":"GET"}}
+```
+
+**Benchmark: 0 allocs/op for dynamic fields*
+
+```txt
+BenchmarkTypedFields_Dynamic-10    15,700,000    72 ns/op    0 B/op    0 allocs/op
+```
+
+### String Literals
+
+For string literals (constants), use the `Str` constructor:
+
+```go
+logger.InfoFields("HTTP", []byte("request"),
+    loggerj.Str("method", "GET"),
+    loggerj.Str("path", "/api/v1/users"),
+)
+```
+
+### Error Handling
+
+The `Err` constructor returns a zero-value `Field` (skipped by encoder) if the error is nil:
+
+```go
+func processOrder(logger *loggerj.Logger, orderID string) error {
+    order, err := db.GetOrder(orderID)
+    if err != nil {
+        logger.ErrorFields("ORDER", []byte("failed to get order"),
+            loggerj.Str("order_id", orderID),
+            loggerj.Err(err),  // Automatically skipped if err is nil
+        )
+        return err
+    }
+
+    logger.InfoFields("ORDER", []byte("order processed"),
+        loggerj.Str("order_id", orderID),
+        loggerj.Err(nil),  // Skipped — no "error" field in output
+    )
+    return nil
+}
+```
+
+### HTTP Middleware Example
+
+Complete HTTP middleware using typed fields:
+
+```go
+func loggingMiddleware(logger *loggerj.Logger, next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        start := time.Now()
+        rw := &responseWriter{ResponseWriter: w, statusCode: 200}
+
+        next.ServeHTTP(rw, r)
+
+        latency := time.Since(start)
+
+        logger.InfoFields("HTTP", []byte("request completed"),
+            loggerj.Str("method", r.Method),
+            loggerj.Str("path", r.URL.Path),
+            loggerj.Int("status", rw.statusCode),
+            loggerj.Dur("latency", latency),
+            loggerj.Str("remote_addr", r.RemoteAddr),
+            loggerj.Int64("bytes_written", int64(rw.bytesWritten)),
+        )
+    })
+}
+```
+
+---
+
+## 5. Multiple Loggers
 
 Different loggers for different purposes, running independently.
 
@@ -203,7 +326,7 @@ auditLogger.InfoString("AUTH", "user login", "user_id", "12345")
 
 ---
 
-## 5. File Logging & Rotation
+## 6. File Logging & Rotation
 
 Automatic log file rotation based on size, with no external dependencies.
 
@@ -227,9 +350,9 @@ defer logger.Close()
 
 ---
 
-## 6. Sampling & Rate Limiting
+## 7. Sampling & Rate Limiting
 
-In v1, these are handled exclusively via `RegisterSub` to ensure lock-free performance.
+These are handled exclusively via `RegisterSub` to ensure lock-free performance.
 
 ### Rate Limiting
 
@@ -276,7 +399,7 @@ for i := 0; i < 10000; i++ {
 
 ---
 
-## 7. Runtime Level Change
+## 8. Runtime Level Change
 
 Change log level at runtime without restarting the application.
 
@@ -302,7 +425,7 @@ logger.DebugString("SQL", "query plan", "sql", "SELECT ...")  // Written
 
 ---
 
-## 8. Concurrent Usage & Graceful Shutdown
+## 9. Concurrent Usage & Graceful Shutdown
 
 `loggerj` is fully thread-safe and designed for high concurrency.
 
@@ -349,7 +472,113 @@ func main() {
 
 ---
 
-## 9. HTTP & Middleware Integration
+## 10. Sync Mode (Audit Trails)
+
+For scenarios requiring **per-log write guarantees** (audit trails, financial logs), `loggerj` offers a sync mode that bypasses the async pipeline. Sync mode is **fixed at creation time** and cannot be toggled at runtime.
+
+### OSBuffered (Default)
+
+Buffered writes with periodic flush (~10ms). **2.7x faster than zerolog sync** (~112 ns/op vs ~300 ns/op).
+
+```go
+logger := loggerj.NewLogger(loggerj.Config{
+    SyncMode:       true,
+    OutputFile:     "/var/log/audit.log",
+    DurabilityTier: loggerj.OSBuffered,  // Default
+    JSONOutput:     true,
+})
+
+// No Start() needed — sync mode writes directly
+logger.InfoFields("AUDIT", []byte("user login"),
+    loggerj.Str("user_id", "12345"),
+    loggerj.Str("ip", "192.168.1.50"),
+    loggerj.Dur("latency", 50*time.Millisecond),
+)
+
+// Graceful shutdown: Flush() is a no-op (already sync), but Close() persists all buffered data
+logger.Close()
+```
+
+**Survives:** Process crash  
+**Does NOT survive:** OS crash / power loss (data may still be in page cache)
+
+### Direct (Per-Log Guarantee)
+
+Each log is written with a single `write()` syscall. No buffering.
+
+```go
+logger := loggerj.NewLogger(loggerj.Config{
+    SyncMode:       true,
+    OutputFile:     "/var/log/audit.log",
+    DurabilityTier: loggerj.Direct,
+    JSONOutput:     true,
+})
+
+logger.InfoString("AUDIT", "user login", "user_id", "12345")
+logger.Close()
+```
+
+**Survives:** Process crash  
+**Does NOT survive:** OS crash / power loss  
+**Throughput:** ~1550 ns/op (syscall overhead)
+
+### FsyncEveryN (Batch Durability)
+
+Calls `fsync()` after every N writes. Survives OS crash / power loss for committed entries.
+
+```go
+logger := loggerj.NewLogger(loggerj.Config{
+    SyncMode:         true,
+    OutputFile:       "/var/log/audit.log",
+    DurabilityTier:   loggerj.FsyncEveryN,
+    FsyncEveryNCount: 100,  // fsync every 100 logs
+    JSONOutput:       true,
+})
+
+for i := 0; i < 1000; i++ {
+    logger.InfoString("AUDIT", fmt.Sprintf("event %d", i))
+}
+// fsync() called 10 times (at logs 100, 200, ..., 1000)
+logger.Close()
+```
+
+**Survives:** Process crash + OS crash / power loss (for committed entries)  
+**Throughput:** ~5000 ns/op (fsync latency amortized)
+
+### FsyncEveryWrite (Maximum Durability)
+
+Calls `fsync()` after every single write. Maximum durability, minimum throughput.
+
+```go
+logger := loggerj.NewLogger(loggerj.Config{
+    SyncMode:       true,
+    OutputFile:     "/var/log/audit.log",
+    DurabilityTier: loggerj.FsyncEveryWrite,
+    JSONOutput:     true,
+})
+
+logger.InfoString("AUDIT", "critical event", "event_id", "12345")
+// fsync() called immediately — data is on disk before this returns
+logger.Close()
+```
+
+**Survives:** Process crash + OS crash / power loss (every log)  
+**Throughput:** ~4-5 ms/op (fsync on every log)  
+**Use case:** Audit trails, financial records, compliance logs
+
+### Durability Tier Decision Matrix
+
+| Scenario | Recommended Tier | Why |
+|----------|------------------|-----|
+| High-volume application logs | **Async mode** (default) | Maximum throughput, acceptable if some logs lost on crash |
+| Audit trails (low volume) | **FsyncEveryWrite** | Every log must survive power loss |
+| Financial transactions | **FsyncEveryN** (N=10-100) | Balance durability and throughput |
+| General logging with sync guarantee | **OSBuffered** | Fast, survives process crash |
+| Debug logs with immediate visibility | **Direct** | No buffering delay |
+
+---
+
+## 11. HTTP & Middleware Integration
 
 ### Standard HTTP Middleware
 
@@ -393,7 +622,7 @@ func LoggerMiddleware(logger *loggerj.Logger) fiber.Handler {
 
 ---
 
-## 10. Error Context & Structured Fields
+## 12. Error Context & Structured Fields
 
 Rich structured logging with full error context.
 
@@ -419,7 +648,7 @@ func processOrder(logger *loggerj.Logger, orderID string, userID string) error {
 
 ---
 
-## 11. Custom Writer & Test Helper
+## 13. Custom Writer & Test Helper
 
 ### Custom Writer (e.g., Kafka)
 
@@ -500,7 +729,7 @@ func (t *TestLogger) Contains(s string) bool {
 
 ---
 
-## 12. Production Configurations
+## 14. Production Configurations
 
 ### Standard Production Config
 
@@ -546,9 +775,30 @@ logger := loggerj.NewLogger(loggerj.Config{
 })
 ```
 
+### Audit Trail Config (Sync Mode)
+
+```go
+logger := loggerj.NewLogger(loggerj.Config{
+    SyncMode:         true,
+    OutputFile:       "/var/log/audit.log",
+    DurabilityTier:   loggerj.FsyncEveryN,
+    FsyncEveryNCount: 10,  // fsync every 10 logs
+    JSONOutput:       true,
+    MaxFileSize:      50 * 1024 * 1024,  // 50 MB
+    MaxBackupFiles:   30,                // Keep 30 days
+})
+
+// No Start() needed — sync mode writes directly
+logger.InfoFields("AUDIT", []byte("user login"),
+    loggerj.Str("user_id", "12345"),
+    loggerj.Str("ip", "192.168.1.50"),
+)
+logger.Close()  // Flushes all buffered data before closing
+```
+
 ---
 
-## 13. Advanced Integrations
+## 15. Advanced Integrations
 
 ### Metrics Integration (Prometheus)
 
@@ -657,7 +907,7 @@ For maximum performance, prefer  `logger.InfoString`  or  `logger.Info`  directl
 
 ---
 
-## 14. Observability
+## 16. Observability
 
 ### Caller Info (Debug Only)
 
@@ -719,9 +969,49 @@ go func() {
 // Usage: kill -USR1 <pid>
 ```
 
+### Sync Mode Write Error Monitoring (v1.3.1)
+
+When using **Sync Mode** for audit trails, failed `write(2)` syscalls indicate
+log loss. `loggerj` v1.3.1 exposes these failures via `Stats.SyncWriteErrors`:
+
+```go
+logger := loggerj.NewLogger(loggerj.Config{
+    SyncMode:       true,
+    OutputFile:     "/var/log/audit.log",
+    DurabilityTier: loggerj.FsyncEveryWrite,
+})
+
+// ... application runs, logs are written synchronously ...
+
+// Monitor sync write failures (e.g., disk full, file handle closed)
+stats := logger.Stats()
+if stats.SyncWriteErrors > 0 {
+    log.Printf("CRITICAL: %d sync writes failed — audit logs may be lost",
+        stats.SyncWriteErrors)
+    // Alert, investigate, remediate
+}
+```
+
+**When `SyncWriteErrors` increments:**
+
+- Disk is full or read-only
+- File handle was closed externally
+- OS-level I/O error (e.g., NFS mount lost)
+- `fsync()` failed (hardware issue)
+
+Every failed write is also logged to `stderr` with tier information:
+
+```txt
+loggerj: sync write error (tier=FsyncEveryWrite): write /var/log/audit.log: no space left on device
+```
+
+**Best practice:** Poll `Stats().SyncWriteErrors` in your observability loop
+(e.g., Prometheus exporter) and alert when non-zero. For audit-critical
+systems, a non-zero counter should trigger immediate investigation.
+
 ---
 
-## 15. Buffer Tuning
+## 17. Buffer Tuning
 
 Fine-tune buffer sizes for your specific workload:
 
@@ -735,7 +1025,7 @@ Fine-tune buffer sizes for your specific workload:
 
 ---
 
-## 16. Context Integration
+## 18. Context Integration
 
 `loggerj` provides opt-in context-aware logging methods (`InfoCtx`, `DebugCtx`, `WarnCtx`, `ErrorCtx`) that extract known keys from `context.Context`. When unused, there is **zero overhead** — the methods behave identically to their non-context counterparts.
 
@@ -796,14 +1086,114 @@ logger.InfoString("HTTP", "request", "user_id", userID, "method", "GET")
 
 ---
 
+## 19. slog.Handler Adapter (Go 1.21+ Ecosystem Integration)
+
+`loggerj` v1.3.1 provides a native `slog.Handler` implementation that routes all
+`slog` calls through loggerj's zero-allocation async pipeline. This lets
+applications adopted to the `log/slog` standard benefit from loggerj's
+throughput without changing call sites.
+
+### Basic Usage
+
+```go
+package main
+
+import (
+    "context"
+    "log/slog"
+    "time"
+
+    "github.com/uretgec/loggerj"
+)
+
+func main() {
+    // 1. Create loggerj logger (async mode)
+    logger := loggerj.NewLogger(loggerj.Config{
+        JSONOutput:   true,
+        FlushTimeout: 50 * time.Millisecond,
+    })
+
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+    go logger.Start(ctx)
+    defer logger.Close()
+
+    // 2. Create slog.Handler wrapping loggerj
+    handler := loggerj.NewSlogHandler(logger, "APP")
+    slogger := slog.New(handler)
+
+    // 3. Use slog API — all calls flow through loggerj's async pipeline
+    slogger.Info("request received",
+        "method", "GET",
+        "path", "/api/v1/users",
+        "status", 200,
+    )
+    // Output: {"ts":...,"level":"INFO","type":"APP","msg":"request received","fields":{"method":"GET","path":"/api/v1/users","status":200}}
+}
+```
+
+### WithAttrs and WithGroup
+
+```go
+handler := loggerj.NewSlogHandler(logger, "HTTP")
+slogger := slog.New(handler)
+
+// WithAttrs: pre-attributes prepended to every record (cold path)
+child := slogger.With("env", "prod", "service", "gateway")
+child.Info("request")
+// Output includes: "env":"prod","service":"gateway"
+
+// WithGroup: nested groups flatten into dotted keys
+grouped := slogger.WithGroup("http")
+grouped.Info("request", "method", "GET")
+// Output: "http.method":"GET" (flattened, not nested object)
+```
+
+### Setting as Default slog Logger
+
+```go
+handler := loggerj.NewSlogHandler(logger, "APP")
+slog.SetDefault(slog.New(handler))
+
+// Now all slog.Info/Warn/Error calls in your application
+// (and third-party libraries using slog) flow through loggerj
+slog.Info("application started")
+```
+
+### Performance Note
+
+```txt
+BenchmarkSlogHandler_Handle-10    8,600,000    143 ns/op    0 B/op    0 allocs/op
+```
+
+The handler's `Handle()` method is allocation-free once warm. The `slog.Attr`
+→ `Field` conversion is boxing-free because `slog.Value` is already a tagged
+union that maps directly to loggerj's `Field` struct.
+
+### Limitations
+
+- **Nested groups flatten to dotted keys** — loggerj's `Field` API does not
+  support nested JSON objects. `WithGroup("http").WithGroup("request")` produces
+  `"http.request.method"` as a single key, not `{"http":{"request":{"method":...}}}`.
+- **Level mapping is bucket-based** — slog's custom intermediate levels (e.g.,
+  `slog.Level(2)`) map to the nearest loggerj level (`LevelInfo`).
+- **Time values render as RFC3339 strings** — for stable JSON output. If you
+  need Unix timestamps, use `Int64("ts", time.Now().Unix())` instead.
+
+---
+
 ## Summary
 
-These examples demonstrate the core philosophy of `loggerj` v2:
+These examples demonstrate the core philosophy of `loggerj`:
 
 1. **Define rules once** using `RegisterSub` (Cold Path).
 2. **Log cleanly and rapidly** using `InfoString`/`ErrorString` (Hot Path).
-3. **Use context-aware methods** (`InfoCtx`/`ErrorCtx`) for distributed tracing (Opt-in).
-4. **Monitor drops** via `SetOnDrop` callback or `Drops()` polling.
-5. **Achieve true zero-allocation** and lock-free concurrency.
+3. **Use typed fields** (`InfoFields` with `Int`, `Bool`, `Dur`) for zero-allocation dynamic values.
+4. **Use context-aware methods** (`InfoCtx`/`ErrorCtx`) for distributed tracing (Opt-in).
+5. **Choose async or sync mode** based on your durability requirements.
+6. **Use slog.Handler** if your application is committed to the `log/slog` standard (v1.3.1).
+7. **Monitor drops** via `SetOnDrop` callback or `Drops()` polling.
+8. **Monitor sync write errors** via `Stats().SyncWriteErrors` for audit trails (v1.3.1).
+9. **Achieve true zero-allocation** and lock-free concurrency.
 
-For detailed performance metrics, see [BENCH.md](BENCH.md). For API reference, see [README.md](README.md).
+For detailed performance metrics, see [BENCH.md](BENCH.md). For API reference, see [README.md](README.md). For competitor comparison, see [COMPARISON.md](COMPARISON.md).

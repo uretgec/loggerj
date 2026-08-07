@@ -23,7 +23,7 @@ Most loggers sacrifice performance for convenience. `loggerj` takes a different 
 - 🔄 **Native log rotation** — size-based with backup retention, zero external dependencies
 - ⏱️ **Sync mode with durability tiers** — 4 explicit tiers (OSBuffered, Direct, FsyncEveryN, FsyncEveryWrite)
 - 🎛️ **Runtime level control** — ~2ns atomic level changes
-- 🔗 **Standard library compatible** — intercept `std log` via `io.Writer` adapter
+- 🔗 **Standard library compatible** — intercept `std log` via `io.Writer` adapter (zero-alloc on Go 1.22+, 1 alloc on Go 1.21 due to compiler escape analysis)
 - 🌐 **slog.Handler adapter** — routes `slog` calls through loggerj's zero-alloc pipeline
 - ✅ **Deterministic flush** — `Flush()` drains channel before writing, no log loss
 - 🧪 **Fuzz-tested** — `appendJSONString`, `appendDuration`, rate-limit window calculation
@@ -79,6 +79,18 @@ func main() {
     logger.Flush()
 }
 ```
+
+## Standard Library Integration
+
+`loggerj` provides an `io.Writer` adapter to intercept logs from Go's standard `log` package and third-party libraries:
+
+```go
+log.SetFlags(0) // Disable std log timestamps; loggerj adds its own
+log.SetOutput(logger.AsWriter(loggerj.LevelInfo, "STDLIB"))
+log.Println("This message flows through loggerj's async pipeline")
+```
+
+> **Version note:** The `AsWriter` adapter is zero-allocation on **Go 1.22+**. On Go 1.21, it shows 1 alloc/op due to less mature escape analysis across the `io.Writer` interface boundary. This is a compiler limitation, not a code bug. The hot-path `InfoString`/`InfoFields` APIs are unaffected.
 
 ## Performance Highlights
 

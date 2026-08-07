@@ -302,7 +302,24 @@ The only exceptions:
 
 ---
 
-## 9. Validation Infrastructure (v1.4.0)
+## 9. Standard Library Integration (AsWriter)
+
+The `AsWriter` adapter intercepts logs from Go's standard `log` package and routes them through loggerj's async pipeline.
+
+| Benchmark | ns/op | allocs/op | Go Version | Notes |
+|---|---|---|---|---|
+| `AsWriter_Write` | ~70 | **0** | Go 1.22+ | `bytes.TrimRight`, zero-copy |
+| `AsWriter_Write` | ~70 | **1** | Go 1.21 | Compiler escape analysis limitation |
+
+### Why the Version Difference?
+
+Go 1.21's escape analyzer cannot prove that the `io.Writer` interface dispatch does not retain the `p []byte` parameter, resulting in 1 alloc/op. Go 1.22+ devirtualizes the interface call and stack-allocates the slice. This is a compiler maturity difference, not a code bug.
+
+**Key insight:** The hot-path `InfoString`/`InfoFields` APIs are unaffected — this allocation only applies to the stdlib-interception adapter. For maximum performance, prefer the native loggerj APIs over `AsWriter`.
+
+---
+
+## 10. Validation Infrastructure (v1.4.0)
 
 v1.4.0 introduced comprehensive validation to prove performance and correctness claims:
 
@@ -341,7 +358,7 @@ regressions.
 
 ---
 
-## 10. Reproducing These Results
+## 11. Reproducing These Results
 
 ```bash
 # Clone the repository
@@ -358,7 +375,7 @@ benchstat old.txt new.txt
 
 ---
 
-## 11. Same Machine Comparison (Run It Yourself)
+## 12. Same Machine Comparison (Run It Yourself)
 
 The competitor numbers in Sections 1-2 are **approximations** from public
 benchmarks and community reports. They vary ±30% by hardware and Go version.

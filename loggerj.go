@@ -907,47 +907,27 @@ func (l *Logger) GetLevel() Level {
 
 // Log is the public core logging method. Caller skip is 1.
 func (l *Logger) Log(level Level, logType string, msg []byte, fields ...string) {
-	if len(fields) == 0 {
-		l.log(level, logType, msg, 1)
-	} else {
-		l.log(level, logType, msg, 1, fields...)
-	}
+	l.log(level, logType, msg, 1, fields...)
 }
 
 // Debug logs a message at LevelDebug. Caller skip is 2.
 func (l *Logger) Debug(logType string, msg []byte, fields ...string) {
-	if len(fields) == 0 {
-		l.log(LevelDebug, logType, msg, 2)
-	} else {
-		l.log(LevelDebug, logType, msg, 2, fields...)
-	}
+	l.log(LevelDebug, logType, msg, 2, fields...)
 }
 
 // Info logs a message at LevelInfo. Caller skip is 2.
 func (l *Logger) Info(logType string, msg []byte, fields ...string) {
-	if len(fields) == 0 {
-		l.log(LevelInfo, logType, msg, 2)
-	} else {
-		l.log(LevelInfo, logType, msg, 2, fields...)
-	}
+	l.log(LevelInfo, logType, msg, 2, fields...)
 }
 
 // Warn logs a message at LevelWarn. Caller skip is 2.
 func (l *Logger) Warn(logType string, msg []byte, fields ...string) {
-	if len(fields) == 0 {
-		l.log(LevelWarn, logType, msg, 2)
-	} else {
-		l.log(LevelWarn, logType, msg, 2, fields...)
-	}
+	l.log(LevelWarn, logType, msg, 2, fields...)
 }
 
 // Error logs a message at LevelError. Caller skip is 2.
 func (l *Logger) Error(logType string, msg []byte, fields ...string) {
-	if len(fields) == 0 {
-		l.log(LevelError, logType, msg, 2)
-	} else {
-		l.log(LevelError, logType, msg, 2, fields...)
-	}
+	l.log(LevelError, logType, msg, 2, fields...)
 }
 
 // -----------------------------------------------------------------------------

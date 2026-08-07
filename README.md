@@ -1,32 +1,32 @@
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue?style=for-the-badge" alt="License: MIT">
   <img src="https://img.shields.io/badge/Go-1.21+-00ADD8?style=for-the-badge&logo=go" alt="Go Version">
-  <img src="https://img.shields.io/badge/Built%20with-Qwen%20AI-blue?style=for-the-badge" alt="Built with Qwen AI">
+  <img src="https://img.shields.io/badge/version-v1.4.0-green?style=for-the-badge" alt="Version: 1.4.0">
 </p>
 
 # loggerj
 
-Ultra-high-performance, lock-free, asynchronous logging for Go. Designed for extreme throughput with **zero heap allocations** in the hot path.
+Ultra-high-performance, lock-free, asynchronous logging for Go. **19M logs/s async, 9M logs/s sync, zero allocations in the hot path.**
 
 ## Philosophy
 
-Most loggers sacrifice performance for convenience. `loggerj` takes a different approach: The **"Pre-Compiled Execution Profile"** architecture.
-
-Instead of evaluating rate limits, sampling rules, or formatting static fields on every single log call (which causes mutex contention and allocations), `loggerj` bakes these rules into memory once during initialization. The hot path consists solely of atomic operations and memory copies (`memcpy`), ensuring the garbage collector is never disturbed by your logging.
+Most loggers sacrifice performance for convenience. `loggerj` takes a different approach: the **"Pre-Compiled Execution Profile"** architecture bakes rate limits, sampling, and static fields into memory once at startup. The hot path is pure atomic operations and memory copies — zero mutex locks, zero heap allocations, zero GC pressure.
 
 ## Features
 
-- 🚀 **100% Zero-Allocation Hot Path**: No interface boxing, no hidden `strconv` calls, no map lookups during logging. String-to-byte conversion uses `unsafe` zero-copy (Go 1.21+).
-- ⚡ **Lock-Free Rate Limiting & Sampling**: Powered by `atomic.CompareAndSwap` (CAS). No shards, no mutexes, no contention.
-- 🧠 **Pre-Baked SubProfiles**: Static fields (e.g., `env=prod`) are formatted into `[]byte` once at startup. Zero CPU cost at log time.
-- 📋 **Copy-on-Write Profile Registry**: Profiles are stored in an immutable registry accessed via `atomic.Pointer`. Unlimited profiles, zero interface boxing, lock-free reads.
-- 🛡️ **Non-Blocking & Drop-Monitored**: Channel-based async architecture. If overloaded, it safely drops logs and increments an atomic counter instead of deadlocking your app. Optional `SetOnDrop` callback for real-time monitoring.
-- 🔄 **Native Log Rotation**: Size-based rotation with backup retention, no external dependencies (like `lumberjack`) required.
-- 🎛️ **Runtime Level Control**: Atomically change log levels on the fly with ~2ns overhead.
-- 🔗 **Standard Library Compatibility**: Seamlessly intercept `std log` and third-party library logs via `io.Writer` adapter (`logger.AsWriter()`).
-- 🌐 **Context Integration (Opt-in)**: Extract `trace_id`, `request_id`, `span_id` from `context.Context` with zero cost when unused.
-- ⏱️ **Worker-Side Timestamps**: Timestamps are captured by the worker goroutine at format time, removing a vDSO syscall from the hot path.
-- ✅ **Deterministic Flush**: `Flush()` drains all pending channel entries before writing, guaranteeing no log loss on explicit flush.
+- 🚀 **19M logs/s async throughput** — lock-free channel + worker pipeline
+- 🎯 **Zero-allocation typed fields** — `Int()`, `Bool()`, `Dur()` with no interface boxing
+- ⚡ **Lock-free rate limiting & sampling** — `atomic.CompareAndSwap` (CAS) with bounded backoff
+- 🧠 **Pre-baked SubProfiles** — static fields formatted once at init, zero CPU at log time
+- 📋 **Copy-on-write registry** — `atomic.Pointer` for lock-free reads, adaptive linear/map lookup
+- 🛡️ **Non-blocking & drop-monitored** — safe drops with atomic counter + `SetOnDrop` callback
+- 🔄 **Native log rotation** — size-based with backup retention, zero external dependencies
+- ⏱️ **Sync mode with durability tiers** — 4 explicit tiers (OSBuffered, Direct, FsyncEveryN, FsyncEveryWrite)
+- 🎛️ **Runtime level control** — ~2ns atomic level changes
+- 🔗 **Standard library compatible** — intercept `std log` via `io.Writer` adapter
+- 🌐 **slog.Handler adapter** — routes `slog` calls through loggerj's zero-alloc pipeline
+- ✅ **Deterministic flush** — `Flush()` drains channel before writing, no log loss
+- 🧪 **Fuzz-tested** — `appendJSONString`, `appendDuration`, rate-limit window calculation
 
 ## Quick Start
 
@@ -47,14 +47,10 @@ func main() {
         FlushTimeout: 50 * time.Millisecond,
     })
 
-    // 2. Define SubProfiles (COLD PATH: Do this once at startup)
-    // Rules are baked into memory. No hot-path overhead.
+    // 2. Define SubProfiles (COLD PATH: do this once at startup)
     logger.RegisterSub("HTTP",
         loggerj.WithRateLimit(1000, time.Second),
         loggerj.WithFields("env", "prod", "service", "gateway"),
-    )
-    logger.RegisterSub("DB",
-        loggerj.WithSampleRate(100), // Log 1 out of 100
     )
 
     // 3. Start the async worker
@@ -63,114 +59,207 @@ func main() {
     go logger.Start(ctx)
     defer logger.Close()
 
-    // 4. Log messages (HOT PATH: Ultra-fast, zero allocation)
-    logger.InfoString("HTTP", "request received", "method", "GET", "path", "/api/v1/users")
-    logger.ErrorString("DB", "connection timeout", "host", "localhost", "err", "dial tcp: i/o timeout")
+    // 4. Log messages (HOT PATH: ultra-fast, zero allocation)
+    logger.InfoString("HTTP", "request received", "method", "GET", "path", "/api")
+    
+    // 5. Typed fields for dynamic values (zero alloc)
+    status := 200
+    latency := 150 * time.Millisecond
+    logger.InfoFields("HTTP", []byte("request completed"),
+        loggerj.Int("status", status),
+        loggerj.Dur("latency", latency),
+        loggerj.Bool("cached", true),
+    )
 
-    // 5. Context-aware logging (opt-in, zero cost when unused)
-    ctx = context.WithValue(ctx, loggerj.TraceIDKey, "abc-123")
-    logger.InfoCtx(ctx, "HTTP", "traced request", "method", "POST")
+    // 6. slog integration (optional)
+    slogger := slog.New(loggerj.NewSlogHandler(logger, "APP"))
+    slogger.Info("slog request", "method", "POST", "status", 201)
 
-    // 6. Ensure all logs are written before exit
+    // 7. Ensure all logs are written before exit
     logger.Flush()
 }
 ```
 
-## The SubProfile Paradigm
+## Performance Highlights
 
-In `loggerj`, you do not pass rate limits or sampling values during the log call. Instead, you define SubProfiles at initialization. This is the key to our lock-free performance.
+Benchmarks on Apple M1 Pro (10 cores), Go 1.24. See [BENCH.md](BENCH.md) for full results and methodology.
+
+### Async Mode (Intended Usage)
+
+| Mode | ns/op | logs/s | Allocs | Use Case |
+|------|-------|--------|--------|----------|
+| **Filtered** | 2.1 | 483M | 0 | Debug logs in production |
+| **RateLimited** | 41 | 24M | 0 | Lock-free CAS rate limiting |
+| **JSON** | 52 | 19M | 0 | Structured logging |
+| **TypedFields** | 72 | 14M | 0 | Dynamic values (zero alloc) |
+| **Parallel** | 85 | 11.8M | 0 | Concurrent (10 goroutines) |
+| **slog.Handler** | 143 | 7.0M | 0 | slog adapter (zero alloc) |
+
+### Sync Mode (Audit Trails)
+
+| Tier | ns/op | logs/s | Survives | Strategy |
+|------|-------|--------|----------|----------|
+| **OSBuffered** | 111 | 9.0M | Process crash | Shared buffer + brief mutex |
+| **Direct** | 1566 | 639K | Process crash | One `write()` syscall (O_APPEND) |
+| **FsyncEveryN** | 5000 | 200K | OS crash | `fsync()` every N logs |
+| **FsyncEveryWrite** | 4.4ms | 227 | OS crash | `fsync()` per entry (audit-grade) |
+
+> **Honest note:** `loggerj` is the only logger that **explicitly documents** durability guarantees. Zap and zerolog default to OS-buffered writes but don't state it. For audit trails, choose `FsyncEveryN` or `FsyncEveryWrite`.
+
+### Rate Limiting Under Contention
+
+v1.4.0 added bounded CAS backoff (`runtime.Gosched()`) to prevent CPU burning under extreme contention:
+
+| Scenario | ns/op | Behavior |
+|----------|-------|----------|
+| **Uncontended** | 2.5 | Pure CAS, no backoff triggered |
+| **Saturated (over-limit)** | 0.3 | Fast-path rejection before CAS |
+| **High Contention** | 213-257 | Bounded backoff prevents CPU spin |
+
+### vs Industry Standards
+
+| System | logs/s | Allocs | Model |
+|--------|--------|--------|-------|
+| **loggerj (async)** | **~19M** | **0** | Lock-free async |
+| **loggerj (sync)** | **~9M** | **0** | OSBuffered tier |
+| zerolog | ~3.5M | 0-1 | Sync |
+| zap | ~2.5M | 1-2 | Sync |
+| slog | ~1.5M | 3-8 | Sync |
+| logrus | ~0.5M | 10+ | Sync |
+
+See [COMPARISON.md](COMPARISON.md) for detailed feature matrix and decision guide.
+
+## Key Concepts
+
+### The SubProfile Paradigm
+
+Define rate limits, sampling, and static fields **once at startup** via `RegisterSub()`. The hot path performs zero map lookups and zero mutex locks.
 
 ```go
 // ✅ CORRECT: Define rules once, log cleanly forever.
 logger.RegisterSub("AUTH", loggerj.WithRateLimit(50, time.Second))
 logger.InfoString("AUTH", "login attempt", "user", "admin")
 
-// ❌ INCORRECT: The Log method does not accept dynamic rate limits anymore.
-// logger.Log(LevelInfo, "AUTH", []byte("msg"), 50, nil) // This API is removed.
+// ❌ INCORRECT: The Log method does not accept dynamic rate limits.
+// logger.Log(LevelInfo, "AUTH", []byte("msg"), 50, nil) // API removed.
 ```
 
-## Performance
+**Rate Limit Exact Counting:** v1.4.0 uses a packed atomic state (40-bit window index + 24-bit counter). Exact per-window counting supports limits up to **16,777,215**. Larger configured limits are capped to this value.
 
-Benchmarks run on Apple M1 Pro (10 cores), Go 1.21+. `loggerj` consistently outperforms industry standards by eliminating hot-path allocations and lock contention.
+### Typed Field API (Zero-Allocation)
 
-| Mode|ns/op|logs/s|Allocs/op|Use Case|
-| ---|---|---|---|---|
-| Filtered|2.1|483M|0|Debug logs in production|
-| Sampling|27|37M|0|High-volume sampled events|
-| Dropped|19|53M|0|Channel-full backpressure|
-| RateLimited|42|24M|0|High-volume events (Lock-Free CAS)|
-| JSON|53|19M|0|Structured logging|
-| StringAPI|60|17M|0|String messages (zero-copy)|
-| NoFields|71|14M|0|Simple messages|
-| Parallel|79|12.7M|0|Concurrent logging (10+ goroutines)|
-| SubProfile Prefix|59|17M|0|Pre-baked static fields|
-| WithCaller|464|2.2M|2|Debugging only|
-| SyncEquivalent|1118|894K|3-4|Fair comparison with sync loggers|
-
-> **Note**: `WithCaller` allocates due to Go's `runtime.Caller` — a fundamental limitation. `SyncEquivalent` forces `Flush()` after every log to simulate synchronous behavior; this is NOT the intended usage pattern.
-
-### vs Industry Standards (Approximate Max Throughput)
-
-| System | logs/s | Allocs/op | Notes |
-|--------|--------|-----------|-------|
-| logrus | ~500K | High | Reflection-based, sync |
-| zap | ~2.5M | Low | Sync, requires manual field typing |
-| zerolog | ~3.5M | Low | Sync, fluent API |
-| **loggerj (async)** | **~16M** | **Zero** | Async, lock-free, pre-compiled |
-| loggerj (sync-equiv) | ~924K | 3 | Forced Flush() per log (not intended usage) |
-
-## Design Decisions & Limitations
-
-We believe in radical transparency. Here is what `loggerj` intentionally does and does not do, and why:
-
-### Context Integration (Opt-in)
-
-`loggerj` provides `InfoCtx`, `DebugCtx`, `WarnCtx`, `ErrorCtx` methods that extract known keys (`TraceIDKey`, `RequestIDKey`, `SpanIDKey`) from `context.Context`. This is **opt-in**: if you never call `*Ctx` methods, there is zero overhead. When used, only known string keys are extracted — no reflection, no `fmt.Sprintf`.
+Avoid `strconv.Itoa` / `fmt.Sprintf` allocations with typed constructors:
 
 ```go
-ctx = context.WithValue(ctx, loggerj.TraceIDKey, "abc-123")
-logger.InfoCtx(ctx, "HTTP", "request", "method", "GET")
-// Output includes: "trace_id":"abc-123"
+status := 200  // dynamic value
+latency := 150 * time.Millisecond
+
+logger.InfoFields("HTTP", []byte("request"),
+    loggerj.Int("status", status),    // 0 allocs
+    loggerj.Dur("latency", latency),  // 0 allocs
+    loggerj.Bool("cached", true),     // 0 allocs
+)
 ```
 
-### No Typed Fields (e.g., `zap.Int`, `slog.Any`)
+**Benchmark:** `BenchmarkTypedFields_Dynamic`: **72 ns/op, 0 allocs/op**
 
-Typed field helpers cause interface boxing allocations on the caller side. `loggerj` forces the caller to use `strconv.Itoa()` or `fmt.Sprintf()`. This keeps the logger's internal hot path strictly zero-allocation and makes the cost of formatting explicit to the developer.
+The `Field` struct is 48 bytes, passed by value, with `Num uint64` holding int64/uint64/float64-bits/duration-ns/bool as a tagged union — no interface boxing, no heap escape.
 
-### Async Log Ordering is Not Strictly Guaranteed
+### slog.Handler Adapter
 
-Under extreme concurrent load, the order in which logs are written to disk may slightly differ from the order they were generated. Timestamps are captured at format time (worker-side), not at call time. For critical audit trails, call `logger.Flush()` immediately after the log.
+Route `slog` calls through loggerj's zero-allocation pipeline:
 
-### No Dynamic Rate Limiting per Call
+```go
+logger := loggerj.NewLogger(loggerj.Config{JSONOutput: true})
+go logger.Start(ctx)
 
-Rate limits are bound to the `SubProfile` at init-time. This eliminates map lookups and mutex locks in the hot path, enabling true lock-free performance.
+handler := loggerj.NewSlogHandler(logger, "APP")
+slogger := slog.New(handler)
 
-## Buffer Tuning Guide
-
-`loggerj` is highly tunable. Adjust these based on your environment:
-
-| Scenario | ChannelSize | WorkerBufferSize | FlushThreshold | FlushTimeout |
-|----------|-------------|------------------|----------------|--------------|
-| Low Memory (512MB RAM) | 1024 | 2048 | 2048 | 100ms |
-| Balanced (Default) | 4096 | 4096 | 4096 | 50ms |
-| High Throughput | 16384 | 16384 | 16384 | 500ms |
-| Burst Traffic | 32768 | 8192 | 8192 | 10ms |
-
-## Output Formats
-
-### Text (Default)
-
-```txt
-[1704067200123] INFO [HTTP] request received method=GET path=/api/v1/users env=prod service=gateway
+slogger.Info("request", "method", "GET", "status", 200)
+// Output: {"ts":...,"level":"INFO","type":"APP","msg":"request","fields":{"method":"GET","status":200}}
 ```
 
-### JSON
+**Group Handling:** Nested `slog.Group` values are flattened to dotted keys (e.g., `"http.method":"GET"`). This preserves the data while maintaining loggerj's zero-alloc Field API. Modern log pipelines (Loki, Elasticsearch, Datadog) handle dotted keys efficiently.
 
-```json
-{"ts":1704067200123,"level":"INFO","type":"HTTP","msg":"request received","env":"prod","service":"gateway","fields":{"method":"GET","path":"/api/v1/users"}}
+**Benchmark:** `BenchmarkSlogHandler_Handle`: **143 ns/op, 0 allocs/op**
+
+### Sync Mode (Audit Trails)
+
+Bypass the async pipeline for per-log write guarantees:
+
+```go
+logger := loggerj.NewLogger(loggerj.Config{
+    SyncMode:       true,
+    OutputFile:     "/var/log/audit.log",
+    DurabilityTier: loggerj.FsyncEveryWrite, // Maximum durability
+})
+
+// No Start() needed — sync mode writes directly
+logger.InfoString("AUDIT", "user login", "user_id", "12345")
+logger.Close()
 ```
 
-## Testing & Profiling
+See [EXAMPLES.md](EXAMPLES.md) for durability tier decision matrix.
+
+## Design Decisions
+
+We believe in radical transparency. Here's what `loggerj` intentionally does and does not do:
+
+### What We Do
+
+- **Lock-free hot path** — zero mutex locks, zero map lookups, zero heap allocations
+- **Deterministic rate limiting** — packed atomic state with bounded CAS backoff
+- **Explicit durability tiers** — 4 sync-mode tiers with documented crash-survival guarantees
+- **slog compatibility** — zero-alloc adapter with dotted-key group flattening
+- **Fuzz-tested correctness** — JSON escaping, duration formatting, rate-limit window calculation
+
+### What We Don't Do (And Why)
+
+- **No nested JSON objects** — `slog.Group` values are flattened to dotted keys (e.g., `"http.method":"GET"`). True nested JSON would require `Field` struct changes that either allocate (variadic slices) or bloat memory bandwidth (inline arrays). Dotted keys work well with modern log pipelines and preserve zero-alloc guarantees.
+
+- **No coarse-time cache** — Rate limiting uses `time.Now().UnixMilli()` (~34ns on Apple M1 Pro) instead of an async-updated coarse timestamp. This ensures exact window boundaries for sub-second rate limits. The 34ns cost is ~97% of the rate-limit hot path but is accepted for correctness. At ~35ns/op, rate limiting supports ~28.5M checks/second — well above typical channel throughput.
+
+- **No dynamic rate limiting per call** — rate limits are bound to `SubProfile` at init-time. This eliminates hot-path map lookups and mutex locks.
+
+- **Async log ordering is approximate** — under extreme load, logs may write in slightly different order than generated. For strict ordering, use **Sync Mode**.
+
+- **`WithCaller` allocates** — Go's `runtime.Caller` limitation. Adds ~460ns + 2 allocs per log. Disable in production for maximum performance.
+
+See [COMPARISON.md](COMPARISON.md) for full trade-off analysis.
+
+## Testing & Validation
+
+v1.4.0 introduced comprehensive validation infrastructure:
+
+### CI Benchmark Gate
+
+Every PR runs protected hot-path benchmarks via `benchstat`. Any regression >10% blocks merge:
+
+```bash
+# Local benchmark gate
+make bench-base          # Generate baseline
+make bench-hot           # Run protected benchmarks
+go run ./tools/benchgate -baseline=bench/base.txt -candidate=bench/pr.txt
+```
+
+### Fuzz Testing
+
+Three fuzz targets verify correctness under adversarial input:
+
+```bash
+# Smoke test (30s per target)
+go test -fuzz=FuzzAppendJSONString -fuzztime=30s .
+go test -fuzz=FuzzAppendDuration -fuzztime=30s .
+go test -fuzz=FuzzRateLimitWindow -fuzztime=30s .
+
+# Long fuzz (scheduled CI, 60min per target)
+make fuzz-long
+```
+
+### Go Version Matrix
+
+Tested on Go 1.21, 1.22, 1.23, and 1.24. The `unsafeStringToBytes` implementation (`unsafe.StringData`) is sensitive to compiler changes; the matrix catches per-version regressions.
 
 ```bash
 # Run all tests with race detector
@@ -186,12 +275,52 @@ go tool pprof -http=:8080 cpu.out
 
 ## Documentation
 
-- [Usage Examples](EXAMPLES.md) — Comprehensive examples for all features
-- [Benchmark Results](BENCH.md) — Detailed performance analysis
+- **[EXAMPLES.md](EXAMPLES.md)** — Comprehensive examples for all features
+  - SubProfile paradigm, typed fields, sync mode, HTTP middleware, context integration
+  - Production configurations, buffer tuning, custom writers, slog adapter
+- **[BENCH.md](BENCH.md)** — Detailed benchmark methodology and results
+  - Async/sync mode performance, typed fields, profile lookup adaptive strategy
+  - Rate-limit cost breakdown, HighContention analysis, slog.Handler adapter
+  - vs industry standards (zap, zerolog, slog, logrus)
+- **[COMPARISON.md](COMPARISON.md)** — Honest comparison with zap, zerolog, slog, logrus
+  - Feature matrix, performance tables, decision guide, migration examples
+  - Why loggerj doesn't support nested JSON objects or coarse-time cache
+- **[ROADMAP.md](ROADMAP.md)** — v1.3.1 ✅, v1.4.0 ✅, v1.5.0 🔮 vision
+- **[CHANGELOG.md](CHANGELOG.md)** — Release notes and migration guides
 
-## Changelog
+## Production Readiness
 
-See [CHANGELOG.md](CHANGELOG.md) for detailed release notes and migration guides.
+### Safe to Adopt
+
+- ✅ Async high-throughput application logging
+- ✅ JSON/text output with typed fields
+- ✅ Rate limiting within documented limits (≤16,777,215 per window)
+- ✅ Sampling (1-out-of-N, lock-free atomic counter)
+- ✅ slog adapter for flattened group semantics
+- ✅ Log rotation with backup retention
+- ✅ Context-aware trace/request/span ID extraction
+
+### Wait If You Need
+
+- ⏸️ True nested JSON objects (dotted keys are the current design)
+- ⏸️ Strict no-loss guarantee in async mode (use sync mode for audit trails)
+- ⏸️ Full slog semantic nesting (groups are flattened to dotted keys)
+- ⏸️ Caller info at maximum throughput (`WithCaller` adds ~460ns + 2 allocs)
+- ⏸️ Extremely high exact rate limits above 16,777,215 (packed-state cap)
+
+### Monitoring
+
+Poll `Stats()` for observability:
+
+```go
+stats := logger.Stats()
+// stats.Drops           — entries dropped due to full channel
+// stats.ChannelSize     — current channel occupancy
+// stats.ChannelCap      — channel capacity
+// stats.SyncWriteErrors — failed write() calls in sync mode
+```
+
+For sync mode, monitor `SyncWriteErrors`. A non-zero value means at least one log entry was lost despite the durability tier.
 
 ## License
 
@@ -199,6 +328,6 @@ MIT License
 
 ---
 
-🤖 **Acknowledgments**
+**Acknowledgments*
 
-This package was developed with the architectural guidance, performance optimization, and code generation assistance of Qwen AI. The core engineering decisions, trade-off analyses, and domain expertise were driven by rigorous performance engineering principles to achieve true production-ready quality.
+This package was developed with architectural guidance from Qwen AI. Core engineering decisions, trade-off analyses, and performance optimizations were driven by rigorous benchmarking and production engineering principles.

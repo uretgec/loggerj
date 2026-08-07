@@ -1,0 +1,172 @@
+name: Benchmark
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: benchmark-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  benchgate:
+    name: Benchmark gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: true
+
+      - name: Build candidate
+        run: go build ./...
+
+      - name: Build benchgate
+        run: go build -o bin/benchgate ./tools/benchgate
+
+      - name: Install benchstat
+        run: go install golang.org/x/perf/cmd/benchstat@latest
+
+      - name: Prepare protected benchmark list
+        run: cp hotpath.txt .pr-hotpath.txt
+
+      - name: Candidate benchmarks
+        run: |
+          set -euo pipefail
+
+          HOT=$(grep -v '^#' .pr-hotpath.txt | paste -sd'|' -)
+          if [ -z "$HOT" ]; then
+            echo "protected benchmark list is empty"
+            exit 1
+          fi
+
+          go test -run='^$' \
+            -bench="$HOT" \
+            -benchmem \
+            -benchtime=2s \
+            -count=6 \
+            -timeout=30m \
+            ./... | tee pr-bench.txt
+
+      - name: Checkout base
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          clean: false
+
+      - name: Build base
+        run: go build ./...
+
+      - name: Base benchmarks
+        run: |
+          set -euo pipefail
+
+          HOT=$(grep -v '^#' .pr-hotpath.txt | paste -sd'|' -)
+          if [ -z "$HOT" ]; then
+            echo "protected benchmark list is empty"
+            exit 1
+          fi
+
+          go test -run='^$' \
+            -bench="$HOT" \
+            -benchmem \
+            -benchtime=2s \
+            -count=6 \
+            -timeout=30m \
+            ./... | tee base-bench.txt
+
+      - name: Checkout PR head again
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          clean: false
+
+      - name: Benchmark gate
+        run: |
+          ./bin/benchgate \
+            -baseline=base-bench.txt \
+            -candidate=pr-bench.txt \
+            -threshold=10 \
+            -benchmarks=.pr-hotpath.txt \
+            -markdown=bench-report.md
+
+      - name: Benchstat report
+        if: always()
+        run: |
+          if [ -f base-bench.txt ] && [ -f pr-bench.txt ]; then
+            $(go env GOPATH)/bin/benchstat base-bench.txt pr-bench.txt > benchstat.txt || true
+          fi
+
+      - name: Comment PR
+        if: always()
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            const marker = '<!-- loggerj-bench-report -->';
+
+            let body = 'Benchmark report not generated.';
+            if (fs.existsSync('bench-report.md')) {
+              body = fs.readFileSync('bench-report.md', 'utf8');
+            }
+
+            if (fs.existsSync('benchstat.txt')) {
+              const benchstat = fs.readFileSync('benchstat.txt', 'utf8');
+              body += '\n\n### benchstat\n\n```\n' + benchstat + '\n```\n';
+            }
+
+            const commentBody = marker + '\n' + body;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+
+            const existing = comments.find(c => c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: commentBody,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: commentBody,
+              });
+            }
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-artifacts
+          path: |
+            base-bench.txt
+            pr-bench.txt
+            bench-report.md
+            benchstat.txt
+          retention-days: 14

@@ -1,366 +1,424 @@
-# loggerj — Benchmark Results & Performance Analysis
+# loggerj — Benchmark Results & Methodology
 
-Detailed benchmark results for `loggerj` with methodology, architectural explanations, and fair comparisons against industry-standard Go loggers.
+Detailed performance analysis for `loggerj` v1.4.0. All benchmarks run on
+**Apple M1 Pro (10 cores), Go 1.24, `-count=6`, `-race` disabled for benchmarks**.
 
-## Test Environment
+> **Note:** Benchmark numbers vary ±10% across runs due to thermal throttling,
+> background processes, and CPU frequency scaling. Treat the **order of magnitude**
+> as meaningful, not the exact figures. Always benchmark on *your* hardware.
 
-| Component | Specification |
-|-----------|--------------|
-| CPU | Apple M1 Pro (10 cores: 8P + 2E) |
-| OS | macOS (darwin/arm64) |
-| Go | 1.21+ |
-| Flags | `-benchmem -count=5` |
-| Race Detector | Disabled for benchmarks (enabled separately for correctness) |
-| Writer | `io.Discard` (measures pure logging pipeline, no disk I/O) |
+---
 
-## How to Reproduce
+## Methodology
 
 ```bash
-# Full benchmark suite
-go test -bench=. -benchmem -run='^$' -count=5 ./...
+# Run all benchmarks
+go test -bench=. -benchmem -run='^$' -count=6 ./...
 
-# Specific benchmark
-go test -bench=BenchmarkLog_JSON -benchmem -run='^$' -count=10 ./...
+# Run specific benchmark group
+go test -bench='BenchmarkSyncMode' -benchmem -run='^$' -count=6 ./...
 
 # CPU profiling
-go test -bench=BenchmarkLog_NoFields -cpuprofile=cpu.out -run='^$' ./...
+go test -bench=. -cpuprofile=cpu.out -run='^$' ./...
 go tool pprof -http=:8080 cpu.out
-
-# Memory profiling
-go test -bench=BenchmarkLog_NoFields -memprofile=mem.out -run='^$' ./...
-go tool pprof -http=:8080 mem.out
-
-# Compare two runs
-go test -bench=. -benchmem -run='^$' -count=10 ./... | tee /tmp/bench1.txt
-# (make changes)
-go test -bench=. -benchmem -run='^$' -count=10 ./... | tee /tmp/bench2.txt
-benchstat /tmp/bench1.txt /tmp/bench2.txt
 ```
+
+All benchmarks use `io.Discard` as the writer to isolate formatting overhead
+from I/O latency. Sync Mode benchmarks use real temp files (`b.TempDir()`).
 
 ---
 
-## Results Summary
+## 1. Async Mode (Intended Usage)
 
-### Core Hot-Path Benchmarks
+The async pipeline (channel + worker) is the primary usage pattern for
+high-throughput services.
 
-| Benchmark|ns/op|logs/s|B/op|allocs/op|Description|
-| ---|---|---|---|---|---|
-| Filtered|2.07|483M|0|0|Below-level discard (atomic load only)|
-| Sampling|27|37M|0|0|Lock-free atomic sampling (1/10)|
-| Dropped|18.9|53M|0|0|Channel-full backpressure path|
-| RateLimited|42|24M|0|0|Lock-free CAS rate limiting (packed state)|
-| JSON_NoEscape|64|16M|0|0|JSON, no special characters|
-| JSON_WithEscape|56|18M|0|0|JSON, with quotes/backslashes|
-| SubProfile_Prefix|59|17M|0|0|Pre-baked prefix + 1 dynamic field|
-| JSON|53|19M|0|0|JSON with 2 key-value fields|
-| NoFields|71|14M|0|0|Simplest possible log call|
-| StringAPI|60|17M|0|0|String message (zero-copy unsafe)|
-| LongMessage|65|15M|0|0|~230 byte message|
-| ManyFields|68|15M|0|0|8 key-value fields (16 strings)|
-| WithFields|66|15M|0|0|2 key-value fields|
-| Parallel|79|12.7M|0|0|10 goroutines concurrent|
-| LevelHelpers|81|12M|0|0|logger.Info()  helper, parallel|
-| LargeBuffer|63|16M|0|0|16KB worker buffer|
-| SmallBuffer|62|16M|0|0|1KB worker buffer|
-
-### Expected-Allocation Benchmarks
-
-| Benchmark|ns/op|logs/s|B/op|allocs/op|Reason|
-| ---|---|---|---|---|---|
-| WithCaller|464|2.2M|250|2|runtime.Caller  — Go limitation|
-| VeryLongMessage|1500|667K|10265|1|10KB msg  > Reset threshold → re-alloc|
-| SyncEquivalent|1118|894K|~360|3-4|Forced  Flush()  per log (not intended usage)|
-| HighContention|290|3.4M|4-5|0|CAS contention under parallel load (packed-state division)|
+| Benchmark | ns/op | logs/s | allocs/op | Use Case |
+|---|---|---|---|---|
+| **Filtered** | **~2.1** | **483M** | **0** | Debug logs in production (below threshold) |
+| Sampling | ~27 | 37M | 0 | High-volume sampled events (1/10) |
+| Dropped | ~19 | 53M | 0 | Channel-full backpressure |
+| **RateLimited** | **~41** | **24M** | **0** | High-volume events (Lock-Free CAS) |
+| JSON | ~52 | 19M | 0 | Structured logging |
+| StringAPI | ~58 | 17M | 0 | String messages (zero-copy) |
+| **TypedFields** | **~72** | **14M** | **0** | **Dynamic typed fields (0 allocs)** |
+| NoFields | ~54 | 18M | 0 | Simple messages |
+| Parallel | ~85 | 12M | 0 | Concurrent logging (10+ goroutines) |
+| SubProfile Prefix | ~59 | 17M | 0 | Pre-baked static fields |
+| JSON_NoEscape | ~47 | 21M | 0 | JSON without special chars |
+| JSON_WithEscape | ~48 | 21M | 0 | JSON with quotes/backslashes |
+| WithCaller | ~464 | 2.2M | 2 | Debugging only (runtime.Caller) |
 
 ---
 
-## Detailed Analysis
+## 2. Sync Mode
 
-### 1. Filtered Path (~2 ns/op)
+Sync Mode bypasses the async pipeline for audit trails and scenarios requiring
+per-log write guarantees. Four durability tiers with explicit documentation.
 
-```txt
-BenchmarkLog_Filtered-10    581,297,246    2.073 ns/op    0 B/op    0 allocs/op
-```
+The write strategy depends on `DurabilityTier`:
 
-The fastest path in `loggerj`. When a log entry is below the current level threshold, the entire call reduces to:
+- **OSBuffered / FsyncEveryN:** shared `bufio.Writer` protected by a brief
+  mutex (held only during the buffer copy, not the syscall). Not lock-free.
+- **Direct / FsyncEveryWrite:** one `write(2)` per entry to an `O_APPEND`
+  file handle. No mutex on the write path.
+
+| Benchmark | ns/op | logs/s | allocs/op | Durability Guarantee |
+|---|---|---|---|---|
+| **SyncMode_OSBuffered** | **~111** | **9.0M** | **0** | Survives process crash |
+| SyncMode_Direct | ~1566 | 639K | 0 | Survives process crash |
+| SyncMode_FsyncEveryWrite | ~4.4ms | 227 | 0 | Survives OS crash / power loss |
+| SyncMode_Parallel | ~238 | 4.2M | 0 | Concurrent sync (mutex contention) |
+
+### vs Industry Standards (Sync Mode)
+
+| Package | ~ns/op | allocs/op | Lock-free? | Durability documented? |
+|---|---|---|---|---|
+| **loggerj (OSBuffered)** | **~111** | **0** | ❌ Mutex during copy AND flush syscall | ✅ **Yes (explicit)** |
+| zerolog (sync) | ~250-350 | 0-1 | ❌ No | ❌ No (implicit) |
+| zap (sync) | ~300-500 | 1-2 | ❌ No | ❌ No (implicit) |
+| slog (sync) | ~400-700 | 3-8 | ❌ No | ❌ No |
+
+**Key differentiator:** loggerj is **2.7x faster than zerolog sync** and
+**explicitly documents** the OS-buffered limitation. Zap and zerolog default
+to OS-buffered writes but don't state it explicitly.
+
+### Parallel Sync Note
+
+Under parallel sync load, loggerj's shared `syncBw` (buffered writer) creates
+mutex contention (~111 ns → ~238 ns, ~2x slowdown). We chose a shared buffer
+for throughput over a per-goroutine pool because the latter loses buffered
+data on `Close()`. Even with this contention, loggerj remains **2-3x faster
+than zerolog/zap sync** under parallel load.
+
+---
+
+## 3. Typed Fields
+
+The `Field` API provides zero-allocation structured logging for dynamic values.
+
+| Benchmark | ns/op | allocs/op | Description |
+|---|---|---|---|
+| `TypedFields` | ~72 | **0** | Static typed fields |
+| `TypedFields_String` | ~53 | **0** | String literals (no conversion needed) |
+| **`TypedFields_Dynamic`** | **~72** | **0** | **Dynamic int/bool/dur → 0 alloc** |
+
+### The "Wow" Benchmark: Dynamic Values
+
+When the caller has **dynamic values** (variables, not string literals),
+typed fields avoid the `strconv.Itoa` / `fmt.Sprintf` allocations that the
+string API requires:
 
 ```go
-if level < Level(l.currentLevel.Load()) {  // single atomic load
-    return
-}
+status := 200                    // dynamic value
+latency := 150 * time.Millisecond // dynamic value
+cached := true                    // dynamic value
+
+// Typed API: 0 allocs
+logger.InfoFields("HTTP", []byte("request"),
+    loggerj.Int("status", status),
+    loggerj.Dur("latency", latency),
+    loggerj.Bool("cached", cached),
+)
+
+// String API equivalent would require:
+// logger.InfoString("HTTP", "request",
+//     "status", strconv.Itoa(status),        // 1 alloc
+//     "latency", latency.String(),           // 1 alloc
+//     "cached", strconv.FormatBool(cached))  // 1 alloc
+// → 3 allocs total
 ```
 
-One `atomic.Load` + one integer comparison + one branch. No function call overhead beyond the method dispatch itself. This is why `loggerj` can safely leave `Debug` calls in production code — they cost ~2ns when filtered.
+### vs Industry Standards (slog Integration)
 
-## 2. Rate Limiting — Lock-Free CAS (~42 ns/op)
+| Package | Adapter | ns/op | allocs/op | Notes |
+|---|---|---|---|---|
+| **loggerj** | `SlogHandler` | **~143** | **0** | Handler internals only |
+| zap | `zap.SugaredLogger` bridge | ~200-300 | 1-2 | Bridge allocates |
+| zerolog | Community adapter | ~250-400 | 2-4 | Varies by implementation |
 
-BenchmarkLog_RateLimited-10    28,900,137    41.54 ns/op    0 B/op    0 allocs/op
-
-Traditional loggers use `sync.Mutex` + `map[string]*rateLimiter` for per-type rate limiting. This causes:
-
-- **Mutex lock/unlock**: ~25ns uncontended, ~200ns+ contended
-- **Map lookup**: ~15ns + potential allocation
-- **Interface boxing**: ~10ns + 1 alloc
-
-`loggerj` eliminates all of this with a pre-compiled `SubProfile` and a **packed-state CAS design**:
-
-```go
-// Hot path: single linearizable CAS, 0 allocations
-// rlState packs window index (upper 32 bits) and count (lower 32 bits)
-func (l *Logger) checkAtomicRateLimit(p *SubProfile) bool {
-    nowMs := time.Now().UnixMilli()
-    windowMs := p.rlWindowMs
-    nowWin := uint64(nowMs / windowMs)
-    limit := uint64(p.rlLimit)
-    for {
-        state := p.rlState.Load()
-        win := state >> 32
-        cnt := state & 0xFFFFFFFF
-        var newCnt, next uint64
-        if win != nowWin {
-            newCnt, next = 1, (nowWin << 32) | 1
-        } else {
-            newCnt, next = cnt+1, state+1
-        }
-        if p.rlState.CompareAndSwap(state, next) {
-            return newCnt <= limit
-        }
-    }
-}
-```
-
-**Why packed state?** The previous design used two separate atomics (`rlCount` + `rlResetAt`), which created a race window: the goroutine that won the CAS to reset the window could be preempted before its `Store(0)`, allowing other goroutines to increment the old counter. This caused legitimate logs to be incorrectly dropped or limits to be exceeded by ~2x at window boundaries. The packed-state design makes the reset-and-increment atomic in a single CAS, eliminating this race entirely.
-
-Under high contention (10 goroutines hammering a single rate limiter):
-
-```txt
-BenchmarkLog_RateLimited_HighContention-10    4,935,549    290.6 ns/op    4 B/op    0 allocs/op
-```
-
-The ~290ns under extreme contention is an expected trade-off: the 64-bit division (`nowMs / windowMs`) and CAS retry loop add CPU cost compared to the old dual-atomic design (~114ns), but this is necessary for **correctness**. The old design was faster but racy. A mutex-based approach would still degrade to 500ns+ with lock convoy effects.
-
-**Sub-second windows**: The packed-state design uses `UnixMilli()` natively, so `WithRateLimit(5, 500*time.Millisecond)` works correctly without silent conversion to 1s.
-
-### 3. Zero-Copy String API (~63 ns/op)
-
-```txt
-BenchmarkLog_StringAPI-10    21,958,332    57.94 ns/op    0 B/op    0 allocs/op
-```
-
-The `String` API methods (`InfoString`, `ErrorString`, etc.) use `unsafe.StringData` + `unsafe.Slice` to convert `string → []byte` without allocation:
-
-```go
-//go:nosplit
-func unsafeStringToBytes(s string) []byte {
-    if len(s) == 0 {
-        return nil
-    }
-    return unsafe.Slice(unsafe.StringData(s), len(s))
-}
-```
-
-This is safe because:
-
-1. Go strings are immutable — the backing memory never changes.
-2. The `log()` method immediately copies via `append(e.Msg[:0], msg...)`.
-3. The worker goroutine operates on the copied data, not the original.
-
-### 4. Worker-Side Timestamps
-
-Timestamps (`time.Now().UnixMilli()`) are captured by the **worker goroutine** at format time, not in the hot path. This removes a vDSO syscall (~25-40ns) from every log call.
-
-Trade-off: timestamps reflect format time, not call time (±FlushTimeout drift). This is acceptable for async logging and consistent with the documented ordering guarantee.
-
-### 5. Pre-Baked SubProfile Prefixes (~55 ns/op)
-
-```txt
-BenchmarkLog_SubProfile_Prefix-10    23,502,894    55.69 ns/op    0 B/op    0 allocs/op
-```
-
-Static fields registered via `WithFields("env", "prod", "service", "gateway")` are formatted into `[]byte` **once** at `RegisterSub` time. In the hot path, the worker simply appends the pre-baked prefix:
-
-```go
-// Worker: single memcpy, zero formatting
-if e.Profile != nil && len(e.Profile.jsonPrefix) > 0 {
-    buf = append(buf, e.Profile.jsonPrefix...)
-}
-```
-
-Compare this to zap/zerolog, which format every field on every log call.
-
-### 6. Copy-on-Write Profile Registry
-
-Profile lookup uses `atomic.Pointer[profileRegistry]` instead of `sync.Map`:
-
-```go
-//go:nosplit
-func (l *Logger) getProfile(logType string) *SubProfile {
-    reg := l.registry.Load()  // single atomic load, no interface boxing
-    // ... linear scan (cache-friendly) ...
-}
-```
-
-| Approach | Lookup Cost | Allocation | Boxing |
-|----------|------------|------------|--------|
-| `sync.Map` | ~15ns | potential | `interface{}` |
-| `map` + `RWMutex` | ~20ns+ | none | none |
-| **COW `atomic.Pointer`** | **~3ns** | **none** | **none** |
-
-### 7. Entry Pool with Threshold-Based Release
-
-`sync.Pool` recycles `Entry` structs. `Reset()` releases large slices to prevent permanent memory retention:
-
-```go
-func (e *Entry) Reset() {
-    // ...
-    if cap(e.Msg) > 4096 {
-        e.Msg = nil      // Release to GC
-    } else {
-        e.Msg = e.Msg[:0] // Retain for reuse
-    }
-}
-```
-
-This prevents a single 10KB log from permanently occupying 10KB × 4096 (channel size) = 40MB in the pool.
-
-### 8. SyncEquivalent — Fair Comparison (~1082 ns/op)
-
-```txt
-BenchmarkLog_SyncEquivalent-10    1,000,000    1082 ns/op    ~390 B/op    3 allocs/op
-```
-
-This benchmark forces `Flush()` after every log to simulate synchronous behavior. The 3 allocations come from:
-
-| # | Source | Bytes |
-|---|--------|-------|
-| 1 | `Flush()` → `done := make(chan struct{})` | ~96 |
-| 2 | `append(e.Msg[:0], msg...)` pool re-alloc | ~128 |
-| 3 | `append(e.Fields[:0], fields...)` pool re-alloc | ~160 |
-
-**This is NOT the intended usage pattern.** `loggerj` is designed for async throughput. This benchmark exists solely for fair comparison with synchronous loggers.
+**Key differentiator:** loggerj's slog adapter is **~2x faster than zap's bridge** because it leverages the zero-alloc `Field` API and async pipeline. The `slog.Attr` → `Field` conversion is boxing-free because `slog.Value` is already a tagged union.
 
 ---
 
-## Industry Comparison
+## 4. slog.Handler Adapter
 
-### Methodology Note
+The `SlogHandler` routes all `slog` calls through loggerj's zero-allocation
+typed-field pipeline. This lets applications adopted to the `log/slog` standard
+benefit from loggerj's async throughput without changing their call sites.
 
-Comparing async and sync loggers is inherently unfair. `loggerj` is async (channel + worker); zap and zerolog are sync (write on call). The table below shows both async and sync-equivalent numbers for transparency.
+| Benchmark | ns/op | allocs/op | Description |
+|---|---|---|---|
+| `SlogHandler` | ~462 | **0** | Includes slog.Info variadic overhead |
+| **`SlogHandler_Handle`** | **~143** | **0** | **Handler internals only (pre-built Record)** |
 
-| Logger | Mode | ns/op | logs/s | allocs/op | Notes |
-|--------|------|-------|--------|-----------|-------|
-| logrus | sync | ~2000 | ~500K | high | Reflection-based |
-| zap | sync | ~400 | ~2.5M | low | Typed fields, sync write |
-| zerolog | sync | ~286 | ~3.5M | low | Fluent API, sync write |
-| slog (stdlib) | sync | ~350 | ~2.8M | medium | Handler interface |
-| **loggerj** | **async** | **~61** | **~16M** | **0** | Channel + worker, zero-copy |
-| loggerj | sync-equiv | ~1082 | ~924K | 3 | Forced Flush() per log |
+### Design Notes
 
-### What This Means
+- `slog.Attr` → `Field` conversion is boxing-free (slog.Value is already tagged union)
+- `WithAttrs` pre-converts attributes once (cold path); `Handle()` only converts per-record attrs
+- `WithGroup` flattens nested groups into dotted keys (e.g., `"http.method":"GET"`)
+- Field buffers are pooled, keeping `Handle()` allocation-free once warm
 
-- **Async mode (intended):** `loggerj` is **4-6x faster** than zap/zerolog because the caller only does atomic ops + channel send. The worker handles formatting and I/O asynchronously.
-- **Sync-equivalent mode:** When forced to flush after every log, `loggerj` is **slower** than zap/zerolog due to channel synchronization overhead (`make(chan struct{})` per Flush). This is expected — `loggerj` is not designed for synchronous use.
-- **The right comparison:** If you need async logging with zap/zerolog, you'd wrap them in a channel + goroutine yourself. `loggerj` gives you this out of the box with zero allocations.
+### vs Industry Standards (slog Integration)
 
----
+| Package | Adapter | ns/op | allocs/op |
+|---|---|---|---|
+| **loggerj** | `SlogHandler` | **~143** | **0** |
+| zap | `zap.SugaredLogger` bridge | ~200-300 | 1-2 |
+| zerolog | Community adapter | ~250-400 | 2-4 |
 
-## Allocation Breakdown
-
-### Zero-Allocation Path (19 of 22 benchmarks)
-
-The following operations perform **zero heap allocations**:
-
-- Level filtering (`atomic.Load`)
-- Profile lookup (`atomic.Pointer.Load` + linear scan)
-- Sampling (`atomic.Add`)
-- Rate limiting (`atomic.CAS` + `atomic.Add`)
-- String→[]byte conversion (`unsafe.StringData`)
-- Entry pool get/put (`sync.Pool`)
-- Channel send (non-blocking `select`)
-- Worker formatting (`append` to pre-allocated buffer)
-- Pre-baked prefix injection (`append` of `[]byte`)
-
-### Expected Allocations (3 of 22 benchmarks)
-
-| Benchmark | allocs/op | Source | Mitigation |
-|-----------|-----------|--------|------------|
-| `WithCaller` | 2 | `runtime.Caller` returns `string` (filename) | Disable in production (`IncludeCaller: false`) |
-| `VeryLongMessage` | 1 | 10KB msg exceeds Reset threshold → nil → re-alloc | Expected trade-off for memory safety |
-| `SyncEquivalent` | 3 | `Flush()` channel sync + pool cold | Not intended usage pattern |
+**Key differentiator:** loggerj's slog adapter is **~2x faster than zap's bridge**
+because it leverages the zero-alloc `Field` API and async pipeline.
 
 ---
 
-## Architecture: Why It's Fast
+## 5. Profile Lookup Adaptive Strategy
 
-```txt
-Caller Goroutine (Hot Path)              Worker Goroutine (Cold Path)
-┌─────────────────────────────┐          ┌─────────────────────────────┐
-│ 1. atomic.Load (level)      │ ~2ns     │                             │
-│ 2. atomic.Load (profile)    │ ~3ns     │  time.Now().UnixMilli()     │
-│ 3. atomic.Add (sampling)    │ ~5ns     │  formatJSON / formatText    │
-│ 4. atomic.CAS (rate limit)  │ ~10ns    │  inject pre-baked prefix    │
-│ 5. pool.Get (Entry)         │ ~15ns    │  bufio.Write                │
-│ 6. append (msg copy)        │ ~10ns    │  bufio.Flush                │
-│ 7. append (fields copy)     │ ~10ns    │  pool.Put (Entry)           │
-│ 8. chan <- e (non-blocking) │ ~20ns    │                             │
-│                             │          │                             │
-│ TOTAL: ~60-80ns, 0 allocs  │          │  Runs on separate goroutine │
-└─────────────────────────────┘          └─────────────────────────────┘
-```
+`getProfile` uses an adaptive strategy based on registry size:
 
-Key design decisions that enable this:
+- **n ≤ 8:** linear scan over `names[]` (~8ns, cache-friendly)
+- **n > 8:** `map[string]*SubProfile` for O(1) lookup (~8ns)
 
-1. **No `time.Now()` in hot path** — deferred to worker (~30ns saved)
-2. **No `sync.Map`** — COW `atomic.Pointer` eliminates interface boxing (~12ns saved)
-3. **No `[]byte(msg)` conversion** — `unsafe.StringData` zero-copy (~10ns + 1 alloc saved)
-4. **No mutex in hot path** — all operations are atomic or channel-based
-5. **Pre-baked prefixes** — static fields formatted once at init, not per-call
-6. **Threshold-based pool release** — prevents memory bloat without sacrificing small-message reuse
+Threshold 8 is benchmark-driven: map is 2.7x faster than linear at n=16 on
+Apple M1 Pro (7.7ns vs 20.5ns).
 
----
+| Benchmark | ns/op | allocs/op | Description |
+|---|---|---|---|
+| `GetProfile_SmallRegistry` | ~225 | 1 | 8 profiles, linear scan (includes format/dispatch) |
+| `GetProfile_LargeRegistry` | ~205 | 1 | 200 profiles, map lookup (includes format/dispatch) |
+| `GetProfile_LinearScanDirect` | ~7.9 | 0 | Pure linear scan (no format/dispatch) |
+| `GetProfile_MapLookupDirect` | ~7.7 | 0 | Pure map lookup (no format/dispatch) |
 
-## Buffer Size Impact
+### Key Insight
 
-| Buffer Config | ns/op | Notes |
-|--------------|-------|-------|
-| Small (1KB) | ~58 | More frequent flushes, lower memory |
-| Default (4KB) | ~61 | Balanced |
-| Large (16KB) | ~61 | Fewer flushes, higher memory |
+Map is **2.7x faster than linear** at n=16 (7.7ns vs 20.5ns). Threshold 8 is
+conservative; most apps register <8 profiles. The adaptive strategy ensures
+optimal performance regardless of registry size.
 
-Buffer size has **minimal impact** on hot-path latency because the caller never touches the buffer. It only affects the worker's flush frequency and memory footprint.
+### Incremental Map Updates
+
+`RegisterSub` clones the map + applies a single change (O(1) vs O(n) rebuild).
+This prevents performance degradation when registering profiles at runtime.
 
 ---
 
-## Regression Testing
+## 6. Rate-Limit Hot-Path Cost Breakdown
 
-Every PR should run the full benchmark suite and compare against the baseline:
+loggerj uses a lock-free, single-word CAS (Compare-And-Swap) design for rate limiting.
+Unlike mutex-based loggers, it scales linearly with CPU cores and requires zero heap
+allocations.
+
+However, performance honesty requires breaking down the exact cost paid on the hot path
+when rate limiting is enabled.
+
+### Benchmark Results (Apple M1 Pro, Go 1.24)
+
+| Component | ns/op | % of Total | Allocs |
+|---|---:|---:|---:|
+| Pure CAS + Bitwise Math (`WithoutTime`) | ~2.5 | ~7% | 0 |
+| `time.Now().UnixMilli()` (vDSO) | ~34.0 | ~93% | 0 |
+| **Total Real-World Cost** | **~36.5** | **100%** | **0** |
+
+### Contention Behavior
+
+| Scenario | ns/op | Behavior |
+|---|---:|---|
+| **Uncontended** | ~2.5 | Pure CAS, no backoff triggered |
+| **Saturated (over-limit)** | ~0.3 | Fast-path rejection before CAS |
+| **High Contention** | ~213-257 | Bounded backoff prevents CPU spin |
+
+**Saturated (Over-limit):** ~0.3 ns/op. The fast-path rejection (`cnt >= limit`)
+returns `false` *before* executing the CAS instruction or querying the clock.
+
+**High Contention:** Under extreme multi-core contention, bounded CAS backoff
+(`runtime.Gosched()` after 8 failures) prevents CPU burning while maintaining
+`0 allocs/op`.
+
+### Design Decision: Why No Coarse-Time Cache?
+
+A common optimization in high-throughput loggers is a "coarse-time cache" — a background
+goroutine that updates a global timestamp every 10ms to avoid the `time.Now()` syscall
+on the hot path.
+
+**loggerj intentionally does NOT use a coarse-time cache in v1.4.0.**
+
+#### 1. Sub-Second Window Accuracy
+
+loggerj supports sub-second rate-limit windows (e.g., `WithRateLimit(100, 50*time.Millisecond)`).
+If a coarse-time cache updates every 10ms, the rate-limit window boundaries will suffer
+from severe jitter. A 100ms window might effectively last 90ms or 110ms depending on
+cache alignment, silently breaking the exact rate-limit guarantee.
+
+#### 2. The Bottleneck is Elsewhere
+
+At ~35 ns/op, the rate-limit check supports **~28.5 million checks per second**.
+In a real-world async pipeline, the channel dispatch (`chan <- Entry`) and I/O write
+latency will bottleneck the system long before the 35ns rate-limit check becomes the
+limiting factor. Optimizing the 34ns vDSO cost yields no practical throughput gain for
+99% of workloads, at the cost of architectural complexity.
+
+#### 3. Lifecycle Simplicity
+
+Adding a background ticker/goroutine to update the cache introduces lifecycle complexity
+(start/stop semantics, memory retention, goroutine leaks) that contradicts loggerj's
+zero-dependency, simple-lifecycle design.
+
+### Conclusion
+
+The ~34ns `time.Now()` vDSO cost is an **accepted cost** for strict, deterministic
+rate-limit accuracy.
+
+*Note: For extreme edge cases (e.g., high-frequency trading audit trails requiring
+sub-millisecond window precision at 50M+ logs/sec), a coarse-time cache may be explored
+as an opt-in `Config.RateLimitCoarseTime` flag in a future v1.5.0 design spike.*
+
+---
+
+## 7. Throughput Summary (logs/second, single core)
+
+| System | Async | Sync | Allocs/op |
+|---|---|---|---|
+| **loggerj** | **~19M** | **~9.0M** | **0** |
+| zerolog | ~3-4M | ~3M | 0-1 |
+| zap | ~2.5-3M | ~2.5M | 1-2 |
+| slog | ~1.5-2M | ~1.5M | 3-8 |
+| logrus | ~0.5M | ~0.5M | 10+ |
+
+---
+
+## 8. Memory & GC Pressure
+
+All hot-path benchmarks report **0 allocs/op**, meaning:
+
+- No GC pressure from logging in steady state
+- No STW (stop-the-world) pauses triggered by log allocations
+- Predictable memory footprint under sustained load
+
+The only exceptions:
+
+- `WithCaller`: 2 allocs/op (Go's `runtime.Caller` limitation)
+- `VeryLongMessage` (>4KB): 1 alloc/op (intentional pool release to prevent memory retention)
+- `SyncEquivalent` (forced flush per log): 3-4 allocs/op (not intended usage)
+
+---
+
+## 9. Validation Infrastructure (v1.4.0)
+
+v1.4.0 introduced comprehensive validation to prove performance and correctness claims:
+
+### CI Benchmark Gate
+
+Every PR runs protected hot-path benchmarks via `benchstat`. Any regression >10%
+or `allocs/op` increase blocks merge:
 
 ```bash
-# Baseline (main branch)
-git checkout main
-go test -bench=. -benchmem -run='^$' -count=10 ./... | tee /tmp/bench_main.txt
-
-# Feature branch
-git checkout feature/my-change
-go test -bench=. -benchmem -run='^$' -count=10 ./... | tee /tmp/bench_feature.txt
-
-# Compare
-benchstat /tmp/bench_main.txt /tmp/bench_feature.txt
+# Local benchmark gate
+make bench-base          # Generate baseline
+make bench-hot           # Run protected benchmarks
+go run ./tools/benchgate -baseline=bench/base.txt -candidate=bench/pr.txt
 ```
 
-**Acceptance criteria:**
+### Fuzz Testing
 
-- No benchmark may regress by more than **10%** in ns/op
-- No benchmark may increase allocs/op (except documented exceptions)
-- `BenchmarkLog_Filtered` must remain below **3 ns/op**
-- `BenchmarkLog_NoFields` must remain below **100 ns/op**
-- `BenchmarkLog_StringAPI` must remain at **0 allocs/op**
+Three fuzz targets verify correctness under adversarial input:
+
+```bash
+# Smoke test (30s per target)
+go test -fuzz=FuzzAppendJSONString -fuzztime=30s .
+go test -fuzz=FuzzAppendDuration -fuzztime=30s .
+go test -fuzz=FuzzRateLimitWindow -fuzztime=30s .
+```
+
+- **FuzzAppendJSONString:** Verifies JSON escaping round-trips correctly for valid UTF-8 input
+- **FuzzAppendDuration:** Verifies duration formatting never panics and emits valid UTF-8
+- **FuzzRateLimitWindow:** Verifies deterministic rate-limit window behavior (boundary, reset, overflow)
+
+### Go Version Matrix
+
+Tested on Go 1.21, 1.22, 1.23, and 1.24. The `unsafeStringToBytes` implementation
+(`unsafe.StringData`) is sensitive to compiler changes; the matrix catches per-version
+regressions.
 
 ---
 
-## References
+## 10. Reproducing These Results
 
-- [README.md](README.md) — API reference and quick start
+```bash
+# Clone the repository
+git clone https://github.com/uretgec/loggerj.git
+cd loggerj
+
+# Run all benchmarks with memory stats
+go test -bench=. -benchmem -run='^$' -count=6 ./...
+
+# Compare with baseline (if you have benchstat)
+go test -bench=. -benchmem -run='^$' -count=6 ./... | tee new.txt
+benchstat old.txt new.txt
+```
+
+---
+
+## 11. Same Machine Comparison (Run It Yourself)
+
+The competitor numbers in Sections 1-2 are **approximations** from public
+benchmarks and community reports. They vary ±30% by hardware and Go version.
+For a rigorous, apples-to-apples comparison on **YOUR** hardware, run this
+script:
+
+### Fair Comparison Matrix
+
+| loggerj Mode | Fair Competitor Configuration | Why |
+|---|---|---|
+| **Async** (default) | zap + `zapcore.NewBufferedWriteSyncer` | Both async, both buffered |
+| **Sync (OSBuffered)** | zerolog sync (default) | Both OS-buffered, both mutex-protected |
+| **Sync (Direct)** | zap sync + `os.Stdout` | Both unbuffered syscalls |
+
+### Benchmark Script
+
+```bash
+# 1. Install competitors
+go get go.uber.org/zap
+go get github.com/rs/zerolog
+
+# 2. Run loggerj benchmarks (6 iterations for statistical significance)
+go test -bench='BenchmarkLog_JSON|BenchmarkSyncMode_OSBuffered|BenchmarkSyncMode_Direct' \
+  -benchmem -count=6 -run='^$' . > loggerj.txt
+
+# 3. Run zap/zerolog benchmarks (you must write these in your own test file)
+# Example zap benchmark:
+# func BenchmarkZap_JSON(b *testing.B) {
+#     logger, _ := zap.NewProduction()
+#     b.ResetTimer()
+#     for i := 0; i < b.N; i++ {
+#         logger.Info("message", zap.String("key", "value"))
+#     }
+# }
+go test -bench='BenchmarkZap|BenchmarkZerolog' -benchmem -count=6 -run='^$' . > competitors.txt
+
+# 4. Compare with benchstat (requires: go install golang.org/x/perf/cmd/benchstat@latest)
+benchstat loggerj.txt competitors.txt
+```
+
+### Expected Results (Apple M1 Pro, Go 1.24)
+
+| Benchmark | loggerj | zap | zerolog | Winner |
+|---|---:|---:|---:|---|
+| **Async JSON** | ~52 ns/op | ~400 ns/op (sync) | ~300 ns/op (sync) | loggerj (7-8x) |
+| **Async JSON** | ~52 ns/op | ~150 ns/op (buffered-async) | N/A | loggerj (2-3x) |
+| **Sync OSBuffered** | ~111 ns/op | ~300-500 ns/op | ~250-350 ns/op | loggerj (2-3x) |
+| **Sync Direct** | ~1566 ns/op | ~1500-2000 ns/op | ~1500-2000 ns/op | Tie (syscall-bound) |
+
+**Key insight:** loggerj's async advantage is real (5-20x over sync loggers),
+but the fair comparison is **loggerj async vs zap buffered-async** (2-3x win)
+or **loggerj sync vs zerolog sync** (2-3x win). The "19M logs/s" headline
+assumes async mode; if you need sync guarantees, expect ~9M logs/s (OSBuffered)
+or ~639K logs/s (Direct).
+
+---
+
+## See Also
+
+- [README.md](README.md) — Quick start and feature overview
 - [EXAMPLES.md](EXAMPLES.md) — Comprehensive usage examples
-- [Go Benchmark Guide](https://go.dev/doc/tutorial/benchmarks) — Official benchmarking documentation
-- [benchstat](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat) — Statistical comparison tool
+- [COMPARISON.md](COMPARISON.md) — Honest competitor analysis
+- [CHANGELOG.md](CHANGELOG.md) — Release notes

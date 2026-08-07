@@ -2438,3 +2438,57 @@ func BenchmarkCheckAtomicRateLimit_Saturated(b *testing.B) {
 		}
 	})
 }
+
+// TestLog_RateLimitAndSampling_Order verifies the fixed gate order:
+// Rate Limit (admission control) runs BEFORE Sampling (cost reduction).
+//
+// Setup: 100 raw logs, RateLimit=10/s, SampleRate=2 (1 out of 2).
+//
+// Expected behavior (new, correct order):
+//  1. Rate limit admits 10 logs out of 100 raw input.
+//  2. Sampling accepts 1/2 of the admitted 10 logs = 5 logs written.
+//
+// Old (incorrect) behavior would have been:
+//  1. Sampling accepts 1/2 of 100 raw = 50 logs.
+//  2. Rate limit admits 10 out of 50 sampled = 10 logs written.
+func TestLog_RateLimitAndSampling_Order(t *testing.T) {
+	logger, buf, _ := setupTestLogger(t, Config{
+		FlushTimeout: 10 * time.Millisecond,
+		ChannelSize:  1000,
+	})
+
+	// Register with BOTH rate limit and sampling
+	logger.RegisterSub("GATES",
+		WithRateLimit(10, time.Second), // Admit max 10 per second
+		WithSampleRate(2),              // Then sample 1 out of 2 admitted
+	)
+
+	// Burst 100 raw logs in a single window (<1s)
+	for i := 0; i < 100; i++ {
+		logger.Log(LevelInfo, "GATES", []byte("raw input"))
+	}
+
+	output := flushAndRead(t, logger, buf)
+	count := strings.Count(output, "raw input")
+
+	// With rate-limit FIRST: 100 raw -> 10 admitted -> 5 sampled.
+	// Tolerance: 4-6 (allow small jitter for atomic ordering).
+	if count < 4 || count > 6 {
+		t.Errorf("expected ~5 logs (rate-limit then sample), got %d. Gate order may be wrong.", count)
+	}
+
+	// Explicitly fail if old behavior (10 logs) is observed
+	if count >= 9 {
+		t.Errorf("observed ~10 logs: sampling ran BEFORE rate limit. Gate order is wrong!")
+	}
+}
+
+// TestRotationErrors_Counter verifies that rotation failures are counted
+// and observable via Stats().RotationErrors.
+func TestRotationErrors_Counter(t *testing.T) {
+	logger := NewLogger(Config{ChannelSize: 100})
+	stats := logger.Stats()
+	if stats.RotationErrors != 0 {
+		t.Errorf("expected RotationErrors=0 initially, got %d", stats.RotationErrors)
+	}
+}

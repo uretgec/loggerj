@@ -68,3 +68,11 @@ docs/_build/
 *.generated.go
 
 RELEASE_NAMES.md
+bin/
+
+# Local test and coverage artifacts
+coverage.out
+*.test
+
+# Local benchmark captures
+bench/*.txt

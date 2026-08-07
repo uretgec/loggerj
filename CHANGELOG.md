@@ -5,186 +5,102 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-For detailed benchmark results and performance methodology, see [BENCH.md](BENCH.md).
-
 ---
 
-## [1.3.1] - 2026-08-07
+## [1.4.0] - 2026-08-07
 
-### 🎉 Major Features
+**Theme:** Trust, Validation, Completeness.
+v1.4.0 focuses on proving performance claims via automation, fixing edge cases in the lock-free rate limiter, and removing unnecessary `unsafe` usage.
 
-#### slog.Handler Adapter (Go 1.21+ Ecosystem Integration)
+### 🛡️ Validation & CI Infrastructure
 
-- **New:** `SlogHandler` struct implementing `slog.Handler` interface
-- **New:** `NewSlogHandler(logger, logType)` constructor
-- **Design:** `slog.Attr` → `Field` conversion is boxing-free (slog.Value is already a tagged union)
-- **Design:** `WithAttrs` pre-converts attributes once (cold path); `Handle()` only converts per-record attrs
-- **Design:** `WithGroup` flattens nested groups into dotted keys (e.g., "outer.inner")
-- **Benefit:** Routes all `slog` calls through loggerj's zero-allocation typed-field pipeline
-- **Benefit:** Adoption doubles for projects committed to the `log/slog` standard
+- **Added:** GitHub Actions CI matrix testing across Go 1.21, 1.22, 1.23, and 1.24.
+- **Added:** Automated `benchstat` regression gate. PRs that regress protected hot-path benchmarks by >10% or increase `allocs/op` are blocked from merging.
+- **Added:** Fuzz testing targets for `appendJSONString`, `appendDuration`, and rate-limit window calculations.
+- **Added:** `Makefile` targets for local baseline generation and benchmark gating.
 
-**Example:**
+### ⚡ Rate-Limit Refactor & Hot-Path Honesty
 
-```go
-logger := loggerj.NewLogger(loggerj.Config{JSONOutput: true})
-go logger.Start(ctx)
+- **Changed:** Rate-limit state layout. Replaced the epoch-based 32-bit window index with a profile-relative 40-bit window index and 24-bit counter. This eliminates overflow risks for long-running processes with sub-millisecond windows.
+- **Changed:** Exact rate limits are now capped at **16,777,215** per window due to the 24-bit counter limit. Larger configured limits are silently capped.
+- **Added:** Bounded CAS backoff. Under extreme contention, the rate-limit CAS loop now yields via `runtime.Gosched()` after 8 failures to prevent CPU burning.
+- **Fixed:** Over-limit calls now return `false` immediately without executing a CAS instruction, reducing CPU spin in saturated states.
+- **Documented:** Published the `time.Now().UnixMilli()` vDSO cost breakdown (~34ns/op). We intentionally do not use a coarse-time cache to preserve exact sub-second window boundaries.
 
-handler := loggerj.NewSlogHandler(logger, "APP")
-slog.SetDefault(slog.New(handler))
+### 🔗 slog.Handler Completeness
 
-// All slog calls now flow through loggerj's async pipeline
-slog.Info("request", "method", "GET", "status", 200)
-slog.With("env", "prod").Info("startup")
-```
+- **Fixed:** `SlogHandler` multi-key group flattening. `slog.Group` attributes and nested `WithGroup` calls now correctly emit dotted keys (e.g., `"http.method":"GET"`) instead of falling back to string representations.
 
-**Benchmark:**
+### 🔒 Security & Maturity
 
-```txt
-BenchmarkSlogHandler_Handle-10    8,600,000    143 ns/op    0 B/op    0 allocs/op
-```
-
-### ⚡ Performance Improvements
-
-#### getProfile Adaptive Map Fallback (n > 8)
-
-- **Changed:** `getProfile` now uses adaptive strategy based on registry size
-- **New:** `profileRegistry.lookup` map field (nil when n ≤ 8, populated when n > 8)
-- **Threshold:** Benchmark-driven — map is 2.7x faster than linear at n=16 on Apple M1 Pro (7.7ns vs 20.5ns)
-- **Incremental updates:** `RegisterSub` clones map + applies single change (O(1) vs O(n) rebuild)
-- **Benefit:** O(1) lookup for large registries (>8 profiles), preventing performance degradation at scale
-
-**Benchmark:**
-
-```txt
-BenchmarkGetProfile_LinearScanDirect-10    152,000,000    7.9 ns/op    0 allocs/op
-BenchmarkGetProfile_MapLookupDirect-10     156,000,000    7.7 ns/op    0 allocs/op
-```
-
-### 🔭 Observability
-
-#### syncWriteErrors Counter for Audit Trails
-
-- **New:** `Stats.SyncWriteErrors` field counts failed `write(2)` calls in sync mode
-- **New:** Every failed write is logged to stderr with tier information
-- **New:** `syncFileWrite()` and `syncFileSync()` helper methods wrap I/O with error counting
-- **Benefit:** Audit-oriented users can now detect log loss via `Stats()` polling
-- **Why:** The audit claim ("per-log write guarantees") is only meaningful if failures are observable
-
-**Example:**
-
-```go
-stats := logger.Stats()
-if stats.SyncWriteErrors > 0 {
-    log.Printf("WARNING: %d sync writes failed — possible log loss", stats.SyncWriteErrors)
-}
-```
-
-### 📚 Documentation
-
-#### Honesty Fixes
-
-- **Changed:** BENCH.md "Benchmark: Sync Mode (Lock-Free O_APPEND)" → "Benchmark: Sync Mode"
-- **Clarified:** Only `Direct` and `FsyncEveryWrite` are truly lock-free on the write path
-- **Clarified:** `OSBuffered` and `FsyncEveryN` use `syncMu` during buffer copy (~5ns), not during syscall
-- **Updated:** README.md sync mode feature description with honest mutex disclosure
-- **Updated:** `syncWrite` doc comment in `loggerj.go` matches the honest docs
-- **Synced:** README.md and BENCH.md benchmark numbers (NoFields ~53ns, Parallel ~85ns, etc.)
-
-**Why this matters:** We claimed "lock-free" in BENCH.md while our own code comment said "Protects syncBw memory copy (not the syscall)". This inconsistency violated our honesty principle. Now docs match code.
+- **Changed:** Replaced `unsafe.Pointer` type-punning for `float64` bit conversions with `math.Float64bits` and `math.Float64frombits`. The Go compiler optimizes these to identical intrinsic CPU instructions, eliminating `unsafe` usage on this path without impacting hot-path performance.
+- **Added:** `docs/rate-limit-cost.md` detailing the exact CPU cost breakdown of the rate-limit hot path.
 
 ### 🧪 Testing
 
 #### New Tests
 
-- `TestSlogHandler_Basic` — simple slog.Info flows through loggerj
-- `TestSlogHandler_Levels` — level filtering respects loggerj's threshold
-- `TestSlogHandler_TypedAttrs` — typed slog attrs convert without boxing
-- `TestSlogHandler_WithAttrs` — pre-attributes prepended to every record
-- `TestSlogHandler_WithGroup` — groups flatten into dotted keys
-- `TestSlogHandler_Enabled` — Enabled() reflects runtime level changes
-- `TestSlogHandler_ValidJSON` — all output is well-formed JSON
-- `TestSlogHandler_ZeroAlloc` — Handle() is allocation-free once warm
-- `TestGetProfile_SmallRegistry_LinearScan` — n ≤ 8 uses linear scan
-- `TestGetProfile_LargeRegistry_MapFallback` — n > 8 uses map O(1)
-- `TestGetProfile_ThresholdCrossing` — adaptive strategy works at n=8→9
-- `TestSyncWriteErrors` — failed writes are counted and observable
+- `TestCheckAtomicRateLimit_BoundaryExact` — Verifies exact boundary behavior.
+- `TestCheckAtomicRateLimit_WindowReset` — Verifies profile-relative window resets.
+- `TestCheckAtomicRateLimit_WindowIndexBeyond32Bit` — Verifies 40-bit window index prevents overflow.
+- `TestCheckAtomicRateLimit_ProfileStartClampsNegative` — Verifies backward clock jumps are clamped.
+- `TestCheckAtomicRateLimit_MaxWindowClamp` — Verifies timestamps beyond the 40-bit range are clamped.
+- `TestWithRateLimit_CapsExactLimit` — Verifies limits >16M are capped.
+- `TestSlogHandler_WithGroup_MultiAttr` — Verifies multi-attribute group flattening.
+- `TestSlogHandler_GroupAttr` — Verifies `slog.Group` attribute flattening.
 
 #### New Benchmarks
 
-- `BenchmarkSlogHandler` — adapter throughput with slog.Info variadic overhead
-- `BenchmarkSlogHandler_Handle` — Handle() method cost (pre-built Record)
-- `BenchmarkGetProfile_SmallRegistry` — linear-scan performance (8 profiles)
-- `BenchmarkGetProfile_LargeRegistry` — map-based O(1) lookup (200 profiles)
-- `BenchmarkGetProfile_LinearScanDirect` — pure linear-scan cost
-- `BenchmarkGetProfile_MapLookupDirect` — pure map-lookup cost
+- `BenchmarkCheckAtomicRateLimit_Uncontended` — Pure CAS cost (~2.5 ns/op).
+- `BenchmarkCheckAtomicRateLimit_HighContention` — CAS cost under multi-core contention.
+- `BenchmarkCheckAtomicRateLimit_Saturated` — Fast-path rejection cost (~0.3 ns/op).
+- `BenchmarkTimeNowUnixMilli` — Isolates vDSO syscall cost (~34 ns/op).
 
-### 📊 Benchmark Results (Apple M1 Pro, Go 1.21+)
+### 📊 Benchmark Results (Apple M1 Pro, Go 1.24)
 
-#### slog.Handler Adapter
+#### Rate-Limit Cost Breakdown
 
-| Benchmark | ns/op | allocs/op | Notes |
-|---|---|---|---|
-| `SlogHandler` | ~462 | 0 | Includes slog.Info variadic overhead |
-| `SlogHandler_Handle` | **143** | **0** | Handler internals only (pre-built Record) |
+| Component | ns/op | % of Total | Allocs |
+|---|---:|---:|---:|
+| Pure CAS + Bitwise Math | ~2.5 | ~7% | 0 |
+| `time.Now().UnixMilli()` (vDSO) | ~34.0 | ~93% | 0 |
+| **Total Real-World Cost** | **~35.2** | **100%** | **0** |
 
-#### getProfile Adaptive Strategy
+#### Contention Behavior
 
-| Benchmark | ns/op | allocs/op | Notes |
-|---|---|---|---|
-| `GetProfile_LinearScanDirect` | ~7.9 | 0 | Pure linear scan (no format/dispatch) |
-| `GetProfile_MapLookupDirect` | ~7.7 | 0 | Pure map lookup (no format/dispatch) |
+| Scenario | ns/op | Behavior |
+|---|---:|---|
+| **Uncontended** | ~2.5 | Pure CAS, no backoff triggered |
+| **Saturated (over-limit)** | ~0.3 | Fast-path rejection before CAS |
+| **High Contention** | ~213-257 | Bounded backoff prevents CPU spin |
 
-**Key insight:** Map is 2.7x faster than linear at n=16. Threshold 8 is conservative; most apps register <8 profiles.
+### 🔄 Migration Guide (v1.3.x → v1.4.0)
 
-#### Async Mode (No Regressions)
+#### Rate Limit Caps
 
-| Benchmark | v1.3.0 | v1.3.1 | Change |
-|---|---|---|---|
-| `Filtered` | ~2.06 ns | ~2.07 ns | Same |
-| `NoFields` | ~53-62 ns | ~53-62 ns | Same |
-| `Parallel` | ~85 ns | ~85 ns | Same |
-
-### 🔒 Security
-
-- No security vulnerabilities addressed (package has zero external dependencies)
-
-### 🚫 Deprecated
-
-- No APIs deprecated
-
-### 🗑️ Removed
-
-- No APIs removed
-
-### 🔄 Migration Guide (v1.3.0 → v1.3.1)
-
-#### If you use slog
+If you previously configured rate limits exceeding 16,777,215 per window:
 
 ```go
-// New (v1.3.1) — route slog through loggerj
-handler := loggerj.NewSlogHandler(logger, "APP")
-slog.SetDefault(slog.New(handler))
-slog.Info("request", "method", "GET")
+// v1.3.x
+logger.RegisterSub("API", loggerj.WithRateLimit(20_000_000, time.Second))
+
+// v1.4.0
+// The limit is automatically capped to 16,777,215. 
+// No code change is required, but be aware of the exact ceiling.
 ```
 
-#### If you register >8 profiles
+#### slog Group Flattening
+
+If you relied on the previous fallback behavior where multi-key `slog.Group` attributes were stringified:
 
 ```go
-// No code change needed — getProfile automatically uses map for n > 8
-logger.RegisterSub("TYPE_1", ...)
-logger.RegisterSub("TYPE_2", ...)
-// ... 200 profiles ...
-// All lookups are now O(1) via map
+// v1.3.x output for slog.Group("http", "method", "GET", "status", 200)
+// "http": "[method=GET status=200]" (string fallback)
+
+// v1.4.0 output
+// "http.method": "GET", "http.status": 200 (dotted keys)
 ```
 
-#### If you monitor sync mode durability
-
-```go
-// New (v1.3.1) — detect sync write failures
-stats := logger.Stats()
-if stats.SyncWriteErrors > 0 {
-    log.Printf("WARNING: %d sync writes failed", stats.SyncWriteErrors)
-}
-```
+This aligns with standard observability pipeline expectations (Loki, Elasticsearch).
 
 All other APIs remain unchanged. No breaking changes for existing users.

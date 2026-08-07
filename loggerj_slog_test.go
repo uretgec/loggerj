@@ -202,3 +202,120 @@ func TestSlogHandler_ZeroAlloc(t *testing.T) {
 		t.Errorf("expected ≤1 allocs/op in SlogHandler.Handle, got %.1f", allocs)
 	}
 }
+
+// TestSlogHandler_WithGroup_MultiAttr verifies WithGroup prefixes all
+// record attributes as dotted keys.
+func TestSlogHandler_WithGroup_MultiAttr(t *testing.T) {
+	slogger, logger, buf := setupSlogTest(t)
+
+	child := slogger.WithGroup("http")
+	child.Info("request", "method", "GET", "status", 200)
+
+	output := flushAndRead(t, logger, buf)
+
+	if !strings.Contains(output, `"http.method":"GET"`) {
+		t.Errorf("expected http.method, got: %s", output)
+	}
+	if !strings.Contains(output, `"http.status":200`) {
+		t.Errorf("expected http.status, got: %s", output)
+	}
+}
+
+// TestSlogHandler_GroupAttr verifies slog.Group attributes are flattened
+// into dotted keys instead of falling back to string.
+func TestSlogHandler_GroupAttr(t *testing.T) {
+	slogger, logger, buf := setupSlogTest(t)
+
+	slogger.Info("request",
+		slog.Group("http",
+			"method", "GET",
+			"status", 200,
+		),
+	)
+
+	output := flushAndRead(t, logger, buf)
+
+	if !strings.Contains(output, `"http.method":"GET"`) {
+		t.Errorf("expected http.method, got: %s", output)
+	}
+	if !strings.Contains(output, `"http.status":200`) {
+		t.Errorf("expected http.status, got: %s", output)
+	}
+}
+
+// TestSlogHandler_NestedGroupAttr verifies nested slog.Group values are
+// flattened recursively.
+func TestSlogHandler_NestedGroupAttr(t *testing.T) {
+	slogger, logger, buf := setupSlogTest(t)
+
+	slogger.Info("request",
+		slog.Group("http",
+			slog.Group("req",
+				"method", "GET",
+				"path", "/api",
+			),
+		),
+	)
+
+	output := flushAndRead(t, logger, buf)
+
+	if !strings.Contains(output, `"http.req.method":"GET"`) {
+		t.Errorf("expected http.req.method, got: %s", output)
+	}
+	if !strings.Contains(output, `"http.req.path":"/api"`) {
+		t.Errorf("expected http.req.path, got: %s", output)
+	}
+}
+
+// TestSlogHandler_WithGroup_Nested verifies nested WithGroup calls produce
+// dotted prefixes.
+func TestSlogHandler_WithGroup_Nested(t *testing.T) {
+	slogger, logger, buf := setupSlogTest(t)
+
+	child := slogger.
+		WithGroup("http").
+		WithGroup("request")
+
+	child.Info("received", "method", "POST")
+
+	output := flushAndRead(t, logger, buf)
+
+	if !strings.Contains(output, `"http.request.method":"POST"`) {
+		t.Errorf("expected http.request.method, got: %s", output)
+	}
+}
+
+// TestSlogHandler_WithAttrs_Group verifies WithAttrs inside a group is
+// pre-converted with the group prefix.
+func TestSlogHandler_WithAttrs_Group(t *testing.T) {
+	slogger, logger, buf := setupSlogTest(t)
+
+	child := slogger.
+		WithGroup("service").
+		With("env", "prod")
+
+	child.Info("boot")
+
+	output := flushAndRead(t, logger, buf)
+
+	if !strings.Contains(output, `"service.env":"prod"`) {
+		t.Errorf("expected service.env, got: %s", output)
+	}
+}
+
+// TestSlogHandler_TimePrecision verifies slog.KindTime values preserve
+// nanosecond precision via RFC3339Nano formatting.
+func TestSlogHandler_TimePrecision(t *testing.T) {
+	slogger, logger, buf := setupSlogTest(t)
+
+	// Use a time with nanosecond precision
+	preciseTime := time.Date(2024, 1, 1, 12, 0, 0, 123456789, time.UTC)
+	slogger.Info("event", "timestamp", preciseTime)
+
+	output := flushAndRead(t, logger, buf)
+
+	// RFC3339Nano preserves nanoseconds: "2024-01-01T12:00:00.123456789Z"
+	if !strings.Contains(output, "123456789") {
+		t.Errorf("expected nanosecond precision in output, got: %s", output)
+	}
+}

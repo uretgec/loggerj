@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"strings"
@@ -921,31 +920,6 @@ func TestLog_CAS_ThunderingHerd(t *testing.T) {
 	if count < 1 {
 		t.Errorf("no logs passed through, count=%d", count)
 	}
-}
-
-func BenchmarkLog_RateLimited_HighContention(b *testing.B) {
-	logger := NewLogger(Config{
-		FlushTimeout:  50 * time.Millisecond,
-		ChannelSize:   65536,
-		IncludeCaller: false,
-	})
-
-	// Single profile with a very high limit (no drops, measure pure CAS contention)
-	logger.RegisterSub("HOT", WithRateLimit(10000000, time.Second))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go logger.StartWithWriter(ctx, io.Discard)
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	// Slam all CPU cores into a single rate-limit state
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			logger.Log(LevelInfo, "HOT", []byte("message"))
-		}
-	})
 }
 
 // -----------------------------------------------------------------------------
@@ -2243,4 +2217,252 @@ func TestGetProfile_ThresholdCrossing(t *testing.T) {
 	if string(p.textPrefix) != "replaced=true " {
 		t.Errorf("expected replaced=true prefix, got %q", string(p.textPrefix))
 	}
+}
+
+// -----------------------------------------------------------------------------
+// RateLimit
+// -----------------------------------------------------------------------------
+
+// TestCheckAtomicRateLimit_BoundaryExact verifies deterministic boundary
+// behavior: exactly limit calls pass inside one window.
+func TestCheckAtomicRateLimit_BoundaryExact(t *testing.T) {
+	p := &SubProfile{
+		rlLimit:    10,
+		rlWindowMs: 1000,
+		rlStartMs:  1_000_000,
+	}
+
+	now := p.rlStartMs + 500
+
+	for i := int64(0); i < 10; i++ {
+		if !checkAtomicRateLimitAt(p, now) {
+			t.Fatalf("call %d should pass", i+1)
+		}
+	}
+
+	if checkAtomicRateLimitAt(p, now) {
+		t.Fatal("call 11 should be rejected")
+	}
+}
+
+// TestCheckAtomicRateLimit_WindowReset verifies the counter resets when the
+// profile-relative window changes.
+func TestCheckAtomicRateLimit_WindowReset(t *testing.T) {
+	p := &SubProfile{
+		rlLimit:    3,
+		rlWindowMs: 1000,
+		rlStartMs:  2_000_000,
+	}
+
+	now := p.rlStartMs
+
+	for i := int64(0); i < 3; i++ {
+		if !checkAtomicRateLimitAt(p, now) {
+			t.Fatalf("call %d should pass in first window", i+1)
+		}
+	}
+
+	if checkAtomicRateLimitAt(p, now) {
+		t.Fatal("fourth call in first window should be rejected")
+	}
+
+	nextWindow := now + 1000
+	if !checkAtomicRateLimitAt(p, nextWindow) {
+		t.Fatal("first call in second window should pass")
+	}
+}
+
+// TestCheckAtomicRateLimit_WindowIndexBeyond32Bit verifies that the new
+// 40-bit profile-relative window index supports values that would overflow
+// a 32-bit window index.
+func TestCheckAtomicRateLimit_WindowIndexBeyond32Bit(t *testing.T) {
+	p := &SubProfile{
+		rlLimit:    2,
+		rlWindowMs: 1,
+		rlStartMs:  1,
+	}
+
+	// int64(1)<<33 milliseconds after profile start produces a window index
+	// greater than 2^32 for a 1ms window.
+	base := p.rlStartMs + (int64(1) << 33)
+
+	if !checkAtomicRateLimitAt(p, base) {
+		t.Fatal("first call should pass")
+	}
+
+	if !checkAtomicRateLimitAt(p, base) {
+		t.Fatal("second call should pass")
+	}
+
+	if checkAtomicRateLimitAt(p, base) {
+		t.Fatal("third call should be rejected")
+	}
+
+	// The next millisecond must open a new window.
+	if !checkAtomicRateLimitAt(p, base+1) {
+		t.Fatal("first call in next window should pass")
+	}
+}
+
+// TestCheckAtomicRateLimit_ProfileStartClampsNegative verifies that a
+// timestamp before the profile start is clamped to elapsed=0.
+func TestCheckAtomicRateLimit_ProfileStartClampsNegative(t *testing.T) {
+	p := &SubProfile{
+		rlLimit:    1,
+		rlWindowMs: 1000,
+		rlStartMs:  5000,
+	}
+
+	nowBeforeStart := p.rlStartMs - 100
+
+	if !checkAtomicRateLimitAt(p, nowBeforeStart) {
+		t.Fatal("first call before start should be clamped and pass")
+	}
+
+	if checkAtomicRateLimitAt(p, nowBeforeStart) {
+		t.Fatal("second call in clamped window should be rejected")
+	}
+}
+
+// TestCheckAtomicRateLimit_MaxWindowClamp verifies timestamps beyond the
+// supported 40-bit window range are clamped instead of wrapping silently.
+func TestCheckAtomicRateLimit_MaxWindowClamp(t *testing.T) {
+	p := &SubProfile{
+		rlLimit:    2,
+		rlWindowMs: 1,
+		rlStartMs:  1,
+	}
+
+	beyond := p.rlStartMs + int64(rlMaxWindow+1)
+
+	if !checkAtomicRateLimitAt(p, beyond) {
+		t.Fatal("first call should pass")
+	}
+
+	if !checkAtomicRateLimitAt(p, beyond) {
+		t.Fatal("second call should pass")
+	}
+
+	if checkAtomicRateLimitAt(p, beyond) {
+		t.Fatal("third call should be rejected")
+	}
+
+	// Because the window index is clamped to rlMaxWindow, the next
+	// millisecond remains in the same clamped window.
+	if checkAtomicRateLimitAt(p, beyond+1) {
+		t.Fatal("call beyond max window clamp should remain rate limited")
+	}
+}
+
+// TestWithRateLimit_CapsExactLimit verifies configured limits above the
+// packed-state exact limit are capped.
+func TestWithRateLimit_CapsExactLimit(t *testing.T) {
+	p := &SubProfile{}
+
+	opt := WithRateLimit(rlMaxExactLimit+1, time.Second)
+	opt(p)
+
+	if p.rlLimit != rlMaxExactLimit {
+		t.Fatalf("expected limit capped to %d, got %d", rlMaxExactLimit, p.rlLimit)
+	}
+
+	if p.rlWindowMs != 1000 {
+		t.Fatalf("expected windowMs=1000, got %d", p.rlWindowMs)
+	}
+
+	if p.rlStartMs == 0 {
+		t.Fatal("expected rlStartMs to be initialized")
+	}
+}
+
+// TestWithRateLimit_NegativeBecomesUnlimited verifies negative limits are
+// treated as unlimited.
+func TestWithRateLimit_NegativeBecomesUnlimited(t *testing.T) {
+	p := &SubProfile{}
+
+	opt := WithRateLimit(-1, time.Second)
+	opt(p)
+
+	if p.rlLimit != 0 {
+		t.Fatalf("expected limit 0 for negative input, got %d", p.rlLimit)
+	}
+}
+
+// TestCheckAtomicRateLimit_Unlimited verifies rlLimit=0 bypasses limiting.
+func TestCheckAtomicRateLimit_Unlimited(t *testing.T) {
+	p := &SubProfile{
+		rlLimit:    0,
+		rlWindowMs: 1000,
+		rlStartMs:  1,
+	}
+
+	now := p.rlStartMs + 1000
+
+	for i := 0; i < 1000; i++ {
+		if !checkAtomicRateLimitAt(p, now) {
+			t.Fatalf("unlimited profile rejected call %d", i)
+		}
+	}
+}
+
+// BenchmarkCheckAtomicRateLimit_Uncontended measures the pure CAS cost
+// when there is no contention. The backoff mechanism must NOT add any
+// overhead to this path.
+func BenchmarkCheckAtomicRateLimit_Uncontended(b *testing.B) {
+	p := &SubProfile{
+		rlLimit:    1_000_000,
+		rlWindowMs: 1000,
+		rlStartMs:  time.Now().UnixMilli(),
+	}
+	now := p.rlStartMs + 500
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = checkAtomicRateLimitAt(p, now)
+	}
+}
+
+// BenchmarkCheckAtomicRateLimit_HighContention isolates the CAS loop
+// under extreme multi-core contention. All goroutines slam the exact
+// same atomic state with a timestamp that never advances the window.
+func BenchmarkCheckAtomicRateLimit_HighContention(b *testing.B) {
+	p := &SubProfile{
+		rlLimit:    rlMaxExactLimit, // Never hit the limit, force CAS retries
+		rlWindowMs: 1000,
+		rlStartMs:  time.Now().UnixMilli(),
+	}
+	now := p.rlStartMs + 500
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_ = checkAtomicRateLimitAt(p, now)
+		}
+	})
+}
+
+// BenchmarkCheckAtomicRateLimit_Saturated measures the cost when the
+// rate limit is actively rejecting logs (cnt >= limit). This path
+// should be extremely fast because it returns false BEFORE the CAS.
+func BenchmarkCheckAtomicRateLimit_Saturated(b *testing.B) {
+	p := &SubProfile{
+		rlLimit:    1,
+		rlWindowMs: 1000,
+		rlStartMs:  time.Now().UnixMilli(),
+	}
+	now := p.rlStartMs + 500
+
+	// Consume the single allowed log
+	_ = checkAtomicRateLimitAt(p, now)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			// All subsequent calls should hit the fast-path rejection
+			_ = checkAtomicRateLimitAt(p, now)
+		}
+	})
 }

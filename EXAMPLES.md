@@ -66,6 +66,10 @@ Comprehensive examples for all `loggerj` features, configurations, and the Pre-C
     - [Setting as Default slog Logger](#setting-as-default-slog-logger)
     - [Performance Note](#performance-note-1)
     - [Limitations](#limitations)
+  - [20. Rate Limit Exact Counting Cap (v1.4.0)](#20-rate-limit-exact-counting-cap-v140)
+  - [21. slog.Group Multi-Key Flattening (v1.4.0)](#21-sloggroup-multi-key-flattening-v140)
+    - [Nested Groups](#nested-groups)
+    - [Why Dotted Keys Instead of Nested JSON?](#why-dotted-keys-instead-of-nested-json)
   - [Summary](#summary)
 
 ---
@@ -1179,6 +1183,136 @@ union that maps directly to loggerj's `Field` struct.
   `slog.Level(2)`) map to the nearest loggerj level (`LevelInfo`).
 - **Time values render as RFC3339 strings** — for stable JSON output. If you
   need Unix timestamps, use `Int64("ts", time.Now().Unix())` instead.
+
+---
+
+## 20. Rate Limit Exact Counting Cap (v1.4.0)
+
+v1.4.0 uses a packed atomic state (40-bit window index + 24-bit counter) for
+lock-free rate limiting. This design supports exact per-window counting up to
+**16,777,215** logs per window. Larger configured limits are silently capped.
+
+```go
+logger := loggerj.NewLogger(loggerj.Config{
+    FlushTimeout: 50 * time.Millisecond,
+})
+
+// This limit is within the exact counting range
+logger.RegisterSub("API", loggerj.WithRateLimit(1_000_000, time.Second))
+// Exact: exactly 1,000,000 logs per second
+
+// This limit exceeds the exact counting range
+logger.RegisterSub("HIGH_VOLUME", loggerj.WithRateLimit(20_000_000, time.Second))
+// Capped: effectively 16,777,215 logs per second
+
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+go logger.Start(ctx)
+defer logger.Close()
+
+// Both profiles work correctly, but HIGH_VOLUME is capped at 16,777,215
+for i := 0; i < 25_000_000; i++ {
+    logger.InfoString("HIGH_VOLUME", "event", "id", fmt.Sprintf("%d", i))
+}
+// ~16,777,215 logs written, rest dropped
+```
+
+**When to use limits >16M:**
+
+If you need rate limits exceeding 16,777,215 per window, consider:
+
+- Using a longer window (e.g., `WithRateLimit(20_000_000, 2*time.Second)` stays within cap)
+- External rate limiting (e.g., `golang.org/x/time/rate`) for exact counts above the cap
+- Accepting the cap if approximate limiting is acceptable
+
+**Why this cap exists:**
+
+The packed atomic state uses 24 bits for the in-window counter to keep the
+entire state in a single `atomic.Uint64`. This enables lock-free CAS operations
+without mutex contention. The trade-off is a hard ceiling on exact counting.
+
+---
+
+## 21. slog.Group Multi-Key Flattening (v1.4.0)
+
+v1.4.0 fixed the `slog.Group` multi-key attribute handling. Previously, groups
+with multiple key-value pairs fell back to string representation. Now all groups
+are correctly flattened into dotted keys, aligning with standard observability
+pipeline expectations (Loki, Elasticsearch, Datadog).
+
+```go
+logger := loggerj.NewLogger(loggerj.Config{
+    JSONOutput:   true,
+    FlushTimeout: 50 * time.Millisecond,
+})
+
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+go logger.Start(ctx)
+defer logger.Close()
+
+handler := loggerj.NewSlogHandler(logger, "APP")
+slogger := slog.New(handler)
+
+// Multi-key slog.Group now produces dotted keys
+slogger.Info("request",
+    slog.Group("http",
+        "method", "GET",
+        "status", 200,
+        "path", "/api/v1/users",
+    ),
+)
+```
+
+**Output (v1.4.0):**
+
+```json
+{"ts":1704067200123,"level":"INFO","type":"APP","msg":"request","fields":{"http.method":"GET","http.status":200,"http.path":"/api/v1/users"}}
+```
+
+**Output (v1.3.x, old behavior):**
+
+```json
+{"ts":1704067200123,"level":"INFO","type":"APP","msg":"request","fields":{"http":"method=GET status=200 path=/api/v1/users"}}
+```
+
+### Nested Groups
+
+Nested `slog.Group` values are recursively flattened:
+
+```go
+slogger.Info("request",
+    slog.Group("http",
+        slog.Group("request",
+            "method", "GET",
+            "path", "/api",
+        ),
+        slog.Group("response",
+            "status", 200,
+            "bytes", 1024,
+        ),
+    ),
+)
+```
+
+**Output:**
+
+```json
+{"ts":1704067200123,"level":"INFO","type":"APP","msg":"request","fields":{"http.request.method":"GET","http.request.path":"/api","http.response.status":200,"http.response.bytes":1024}}
+```
+
+### Why Dotted Keys Instead of Nested JSON?
+
+loggerj's `Field` API is designed for zero-allocation hot-path performance.
+True nested JSON objects would require either:
+
+- Variadic slices (heap allocation)
+- Inline arrays (memory bandwidth bloat)
+- Interface boxing (allocation)
+
+Dotted keys preserve the zero-allocation guarantee while working well with
+modern log aggregation pipelines that treat dotted keys as equivalent to
+nested objects for indexing and querying.
 
 ---
 

@@ -5,146 +5,58 @@ Every item ships with a benchmark gate — no item lands if it regresses the hot
 
 ---
 
-## ✅ v1.3.1 — Shipped (2026-08-07)
-
-Theme: **Ecosystem integration, observability, and honest documentation.**
-
-### P0 — Completed
-
-- [x] **slog.Handler adapter** (`loggerj/slog`)
-      - Routes `slog` calls through loggerj's zero-allocation typed-field pipeline
-      - `slog.Attr` → `Field` conversion is boxing-free (slog.Value is already tagged union)
-      - `WithAttrs` pre-converts attributes once (cold path); `Handle()` only converts per-record attrs
-      - `WithGroup` flattens nested groups into dotted keys (e.g., "outer.inner")
-      - **Benchmark:** `BenchmarkSlogHandler_Handle`: **143 ns/op, 0 allocs/op**
-      - Matches zap's slog bridge performance while maintaining loggerj's async throughput
-
-- [x] **getProfile adaptive map fallback** (threshold n > 8)
-      - Small registries (n ≤ 8): linear scan (~8ns, cache-friendly)
-      - Large registries (n > 8): map O(1) lookup (~8ns, scales to thousands)
-      - Benchmark-driven threshold: map is 2.7x faster than linear at n=16 on Apple M1 Pro
-      - Incremental map updates on `RegisterSub` (O(1) clone + apply change)
-      - **Benchmark:** `BenchmarkGetProfile_MapLookupDirect`: **~8 ns/op** (same as linear)
-
-- [x] **syncWriteErrors observability**
-      - New `Stats.SyncWriteErrors` field counts failed write(2) calls in sync mode
-      - Every failed write is logged to stderr with tier information
-      - Audit-oriented users can now detect log loss via `Stats()` polling
-      - Wraps `syncFile.Write()` and `syncFile.Sync()` with error counting
-
-- [x] **Documentation honesty fixes**
-      - BENCH.md: Changed "Lock-Free O_APPEND" → "Sync Mode (Shared-Buffer, Brief Mutex)"
-      - Clarified: only `Direct` and `FsyncEveryWrite` are truly lock-free
-      - `OSBuffered` and `FsyncEveryN` use `syncMu` during buffer copy (~5ns), not syscall
-      - README.md: Sync mode feature description updated with honest mutex disclosure
-      - README/BENCH.md: Benchmark numbers synchronized (NoFields ~53ns, Parallel ~85ns, etc.)
-
-### P1 — Completed
-
-- [x] **README.md updated** — Sync mode mutex disclosure, benchmark sync
-- [x] **BENCH.md updated** — Honest lock-free status per tier
-- [x] **EXAMPLES.md updated** — slog.Handler usage examples (if added)
-
-### P2 — Deferred to v1.4.0
-
-- [ ] **CI benchmark automation** — GitHub Actions with `benchstat` for PR diffs
-- [ ] **Burst-then-decay sampling** — token bucket for legitimate traffic spikes
-- [ ] **JSON `FlatStaticFields` option** — lift pre-baked fields to top level for Loki/ES
-
-### Acceptance Gates — All Met
-
-- ✅ `BenchmarkSlogHandler_Handle`: 143 ns/op, 0 allocs/op (target: <150ns)
-- ✅ `BenchmarkGetProfile_MapLookupDirect`: ~8 ns/op (target: <10ns)
-- ✅ `TestSyncWriteErrors`: PASS (counter > 0 after closed file write)
-- ✅ All 75+ tests PASS under `-race` (0 DATA RACE)
-- ✅ README/BENCH.md benchmark numbers synchronized
-
----
-
 ## 🔧 v1.4.0 — In Planning
 
 Theme: **Trust, Validation, Completeness.**
-v1.3.x added performance features. v1.4.0 must *prove* those claims under
-automation and *close* the honest gaps documented in COMPARISON.md. Every
-item ships with a benchmark gate — no item lands if it regresses the hot path.
 
-### Phase 1: Validation Infrastructure (P0) — the trust foundation
+v1.3.x added performance features. v1.4.0 must *prove* those claims under
+automation and *close* the honest gaps documented in COMPARISON.md.
+
+### Phase 1: Validation Infrastructure (P0)
 
 Without automation, every performance and safety claim is unverified.
 
 - [ ] **CI benchmark automation (benchstat)** — GitHub Actions runs the full
-      benchmark suite on every PR and posts a `benchstat` diff comment
-      (baseline vs PR). Any hot-path regression >10% blocks merge.
-      This replaces hand-maintained README/BENCH.md numbers with
-      machine-verified ones.
-- [ ] **Go version matrix CI** — test on Go 1.21, 1.22, 1.23, 1.24 (and tip).
-      Required because `unsafeStringToBytes` (`unsafe.StringData` +
-      `go:nosplit`) is sensitive to compiler/runtime changes. Catches
-      per-version regressions before release.
-- [ ] **Fuzzing targets** — `go-fuzz` / `go test -fuzz` for:
-      `appendJSONString` (escaping correctness), `appendDuration`,
-      and the rate-limit window calculation. Targets the two highest-risk
-      parsers.
+      benchmark suite on every PR and posts a `benchstat` diff comment.
+      Any hot-path regression >10% blocks merge.
+- [ ] **Go version matrix CI** — test on Go 1.21–1.24 (and tip).
+      Required because `unsafeStringToBytes` is sensitive to compiler changes.
+- [ ] **Fuzzing targets** — `go test -fuzz` for `appendJSONString`,
+      `appendDuration`, and rate-limit window calculation.
 - [ ] **Coverage reporting** — publish coverage; track untested branches
-      in the sync-mode and rotation paths.
+      in sync-mode and rotation paths.
 
-### Phase 2: Hot-Path Honesty (P1) — fix what we claimed
+### Phase 2: Hot-Path Honesty (P1)
 
 Close the gaps that partially undermine the "zero-cost hot path" claim.
 
-- [ ] **CAS backoff** — add bounded retry with `runtime.Gosched()` (or
-      exponential pause) after N failed CAS attempts in
-      `checkAtomicRateLimit`. Eliminates unbounded spin under extreme
-      contention. Gate: HighContention benchmark must not regress.
+- [ ] **CAS backoff** — bounded retry with `runtime.Gosched()` after N failed
+      CAS attempts in `checkAtomicRateLimit`. Eliminates unbounded spin.
 - [ ] **Publish HighContention benchmark** — report
-      `BenchmarkLog_RateLimited_HighContention` results in BENCH.md with a
-      per-core-scale analysis. We already run this test but never published it.
-- [ ] **Measure & document `time.Now()` rate-limit cost** — quantify the
-      vDSO cost currently paid on every rate-limited call. Decide: document
-      as accepted cost, or design a coarse-time cache.
-- [ ] **Coarse-time cache (design spike)** — *exploratory, may defer to
-      v1.5.0.* Optional config flag that uses an async-updated coarse
-      timestamp for rate limiting, trading window precision for hot-path
-      speed. Must not silently weaken rate-limit accuracy.
+      `BenchmarkLog_RateLimited_HighContention` in BENCH.md with per-core analysis.
+- [ ] **Measure & document `time.Now()` rate-limit cost** — quantify the vDSO
+      cost. Decide: document as accepted cost, or design a coarse-time cache.
 
-### Phase 3: Structured Logging Completeness (P1) — close the feature gap
+### Phase 3: Structured Logging Completeness (P1)
 
 The two biggest feature losses are nesting and slog-semantic fidelity.
 
 - [ ] **Nested field design spike** — research a `GroupField` / recursive
-      `Field` design that emits real nested JSON objects. Compare against
-      `zap.Object` and `zerolog.Dict()` on both ergonomics and alloc cost.
-      Must stay zero-alloc or the feature is rejected.
-- [ ] **Benchmark vs zap.Object / zerolog.Dict** — publish an honest
-      nesting-performance comparison before implementing.
-- [ ] **Real `slog.Group` nesting** — *depends on nested fields landing.*
-      Once nested objects exist, stop flattening groups to dotted keys and
-      emit true nested JSON, making the slog adapter a faithful drop-in.
-- [ ] **JSON `FlatStaticFields` option** — lift pre-baked fields to the top
-      level for Loki/ES pipeline compatibility.
+      `Field` design that emits real nested JSON objects. Must stay zero-alloc
+      or the feature is rejected.
+- [ ] **Real `slog.Group` nesting** — depends on nested fields landing.
+      Stop flattening groups to dotted keys; emit true nested JSON.
+- [ ] **JSON `FlatStaticFields` option** — lift pre-baked fields to top level
+      for Loki/ES pipeline compatibility.
 
 ### Phase 4: Maturity & Documentation (P2)
 
-Address the release-cadence and trust signals directly.
-
-- [ ] **Release cadence policy** — publish a semver discipline and
-      breaking-change policy. Commit to a minimum stabilization window
-      between minor releases to counter the "three releases in one day" signal.
-- [ ] **Production readiness checklist** — explicit "safe to adopt" vs
-      "wait" guidance based on workload type.
+- [ ] **Release cadence policy** — publish semver discipline and breaking-change
+      policy. Minimum stabilization window between minor releases.
+- [ ] **Production readiness checklist** — explicit "safe to adopt" vs "wait"
+      guidance based on workload type.
 - [ ] **`unsafe` security review** — formal review of `unsafeStringToBytes`
       and `floatToBits` against the Go memory model; document invariants.
-
-### Deferred to v1.5.0+ (research, not committed)
-
-- [ ] **Group Commit (Option B)** — leader/follower batching so sync logging
-      gets *faster* under concurrency (N logs → 1 `writev`). Significant
-      correctness undertaking; research spike first.
-- [ ] **Burst-then-decay sampling** — token bucket for legitimate spikes.
-- [ ] **Blocking drop policy** — optional `Config.BlockOnFull` for audit cases.
-- [ ] **Multi-worker fan-out** — multiple format workers; ordering trade-off.
-- [ ] **Plugin / Core interface** — intentionally deferred; revisit only if
-      there is real demand, as it conflicts with the zero-overhead design.
 
 ### Acceptance Gates (all must pass before v1.4.0 ships)
 
@@ -157,11 +69,85 @@ Address the release-cadence and trust signals directly.
 
 ---
 
+## 🔮 v1.5.0 — Future
+
+Theme: **Ecosystem Integration & Production Durability.**
+
+v1.4.0 proves the core claims. v1.5.0 integrates loggerj into the broader
+Go observability ecosystem and adds production-grade durability features.
+
+### Phase 1: Coarse-Time Cache (P0)
+
+Optional opt-in flag that trades rate-limit window precision for hot-path speed.
+
+- [ ] **`Config.RateLimitCoarseTime`** — async-updated coarse timestamp for
+      rate limiting. Hot path reads `atomic.Int64` (~1ns) instead of
+      `time.Now()` (~34ns).
+- [ ] **`Config.RateLimitCoarseInterval`** — refresh interval (default 10ms).
+- [ ] **Benchmark gate** — coarse-time rate-limit hot path <5ns/op.
+- [ ] **Documentation** — warn that sub-second windows <50ms are not
+      recommended with coarse time.
+
+### Phase 2: True Nested JSON Objects (P1)
+
+New buffer architecture for real nested JSON without allocation.
+
+- [ ] **Pre-compiled nested profiles** — `WithNestedFields` for static nested
+      JSON baked at init time. Hot-path cost: 0ns (memcpy of pre-baked prefix).
+- [ ] **`ObjectEncoder` interface** — zap-compatible dynamic nested JSON for
+      sync mode. Allocates; documented trade-off.
+- [ ] **Benchmark vs zap.Object / zerolog.Dict** — publish honest comparison.
+
+### Phase 3: OpenTelemetry & Observability (P1)
+
+- [ ] **OTel trace context extraction** — opt-in via build tag. Zero cost
+      when not compiled in.
+- [ ] **Prometheus metrics collector** — optional sub-package exporting
+      `loggerj_drops_total`, `loggerj_channel_size`, etc.
+
+### Phase 4: Hook System & PII Masking (P2)
+
+- [ ] **Pre-format hook API** — `AddHook(func(e *Entry))` runs on caller's
+      goroutine. Zero cost when no hooks registered.
+- [ ] **Field-level hook API** — `AddFieldHook(func(f Field) Field)` for
+      per-field masking (e.g., PII redaction).
+
+### Phase 5: Advanced Output (P2)
+
+- [ ] **Multi-writer fan-out** — `Config.Writers []io.Writer` for simultaneous
+      stderr + file + network output. Caller-side cost: 0ns.
+- [ ] **Network shipping** — optional `loggerj/network` sub-package for
+      TCP/UDP log shipping with reconnection.
+
+### Deferred (research, not committed)
+
+- [ ] **Group Commit (Option B)** — leader/follower batching so sync logging
+      gets faster under concurrency (N logs → 1 `writev`). Significant
+      correctness undertaking; research spike first.
+- [ ] **Burst-then-decay sampling** — token bucket for legitimate spikes.
+- [ ] **Blocking drop policy** — optional `Config.BlockOnFull` for audit cases.
+- [ ] **Multi-worker fan-out** — multiple format workers; ordering trade-off.
+- [ ] **Plugin / Core interface** — intentionally deferred; revisit only if
+      there is real demand, as it conflicts with zero-overhead design.
+
+### Acceptance Gates (all must pass before v1.5.0 ships)
+
+- ✅ Coarse-time cache opt-in, <5ns rate-limit hot path when enabled
+- ✅ Pre-compiled nested profiles: 0ns hot-path cost
+- ✅ ObjectEncoder for sync mode: documented allocation trade-off
+- ✅ OTel trace extraction: 0ns when disabled via build tag
+- ✅ Prometheus collector: optional sub-package, no runtime dependency
+- ✅ Pre-format hook API: 0ns when no hooks registered
+- ✅ Multi-writer fan-out: 0ns caller-side cost
+- ✅ All hot-path benchmarks pass benchstat gate (>10% regression blocked)
+- ✅ Backward compatibility maintained (semver)
+
+---
+
 ## Guiding Principles
 
 1. **Zero-allocation hot path is non-negotiable.** Every feature is measured.
 2. **Zero external dependencies.** Rotation, rate limiting, everything in-house.
 3. **Honest positioning.** We document where we lose, not just where we win.
 4. **Think twice, build once.** Each step ships with a benchmark gate.
-5. **Sync mode is fixed at creation.** No runtime mode switching — this keeps
-   both paths lean and branch-predictor friendly.
+5. **Sync mode is fixed at creation.** No runtime mode switching — this keeps both paths lean and branch-predictor friendly.

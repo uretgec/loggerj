@@ -10,41 +10,37 @@ import (
 // -----------------------------------------------------------------------------
 // slog.Handler Adapter (Go 1.21+ Ecosystem Integration)
 // -----------------------------------------------------------------------------
-
-// SlogHandler implements slog.Handler, routing all slog calls through
-// loggerj's zero-allocation typed-field pipeline. This lets applications
-// adopted to the log/slog standard benefit from loggerj's async throughput
-// (or sync durability) without changing their call sites.
 //
-// Design notes:
-//   - slog.Attr → loggerj.Field conversion is boxing-free: slog.Value is
-//     already a tagged union, so we map Kind → FieldType directly.
-//   - WithAttrs pre-converts attributes into Fields once (cold path);
-//     the hot-path Handle() only converts the per-record attributes.
-//   - WithGroup flattens nested groups into dotted keys (e.g., "g.b").
-//     loggerj's Field API does not support nested objects; flattening
-//     preserves the data at the cost of JSON nesting depth.
-//   - Field buffers are pooled, keeping Handle() allocation-free once warm.
+// SlogHandler implements slog.Handler, routing all slog calls through
+// loggerj's zero-allocation typed-field pipeline.
+//
+// Group handling follows the loggerj Field model: nested groups are
+// flattened to dotted keys. Example:
+//
+//	slog.Group("http", "method", "GET")
+//
+// becomes:
+//
+//	"http.method":"GET"
+//
+// This keeps the Field API allocation-free and works well with flat log
+// pipelines such as Loki, Elasticsearch, and Datadog.
 type SlogHandler struct {
 	logger  *Logger
 	logType string
 
-	// attrs holds pre-converted WithAttrs fields. Populated once at
-	// WithAttrs time (cold path); copied by value into every Handle call.
+	// attrs holds pre-converted WithAttrs fields.
 	attrs []Field
 
-	// group is the current WithGroup prefix ("" = no group). Group names
-	// are dotted together for nested groups (e.g., "outer.inner").
+	// group is the current WithGroup prefix.
 	group string
 
 	// fieldPool amortizes the per-Handle []Field slice allocation.
-	// Shared across all handlers derived from the same root logger.
 	fieldPool *sync.Pool
 }
 
 // slogFieldPool is a package-level pool of []Field slices used by
-// SlogHandler.Handle. Shared across all SlogHandler instances to
-// maximize buffer reuse under concurrent slog traffic.
+// SlogHandler.Handle.
 var slogFieldPool = sync.Pool{
 	New: func() any {
 		buf := make([]Field, 0, 32)
@@ -53,15 +49,7 @@ var slogFieldPool = sync.Pool{
 }
 
 // NewSlogHandler returns a slog.Handler that routes all records into the
-// given Logger under the specified logType. Use with slog.New:
-//
-//	logger := loggerj.NewLogger(loggerj.Config{JSONOutput: true})
-//	go logger.Start(ctx)
-//	slog.SetDefault(slog.New(loggerj.NewSlogHandler(logger, "APP")))
-//	slog.Info("request", "method", "GET", "status", 200)
-//
-// The handler respects the logger's current level (SetLevelValue) and
-// inherits its durability/async mode.
+// given Logger under the specified logType.
 func NewSlogHandler(l *Logger, logType string) *SlogHandler {
 	return &SlogHandler{
 		logger:    l,
@@ -70,74 +58,74 @@ func NewSlogHandler(l *Logger, logType string) *SlogHandler {
 	}
 }
 
-// Enabled implements slog.Handler. Reports whether the handler would
-// process a record at the given level. Delegates to loggerj's atomic
-// level check (~2ns) so SetLevelValue takes effect immediately.
+// Enabled implements slog.Handler.
 func (h *SlogHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	return level >= loggerjToSlogLevel(h.logger.GetLevel())
 }
 
-// Handle implements slog.Handler. Converts the record's attributes to
-// loggerj Fields (boxing-free) and dispatches through logTyped.
-// Pre-attributes from WithAttrs are prepended; group prefixes from
-// WithGroup are applied as dotted keys.
+// Handle implements slog.Handler.
 func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
 	level := slogToLoggerjLevel(r.Level)
 
-	// Acquire a pooled Field buffer: cap covers pre-attrs + record attrs.
 	bp := h.fieldPool.Get().(*[]Field)
 	fields := (*bp)[:0]
 
 	// Prepend pre-converted WithAttrs fields.
 	fields = append(fields, h.attrs...)
 
-	// Convert per-record attributes (slog.Attr → loggerj.Field).
+	// Convert per-record attributes.
 	r.Attrs(func(a slog.Attr) bool {
-		fields = append(fields, h.convertAttr(a))
+		fields = h.appendAttr(fields, a)
 		return true
 	})
 
-	// Dispatch through the typed-field hot path (zero-alloc after warmup).
-	// skip=4: Handle → slog dispatch → slog.Info/Warn/etc → caller.
+	// Dispatch through the typed-field hot path.
+	// skip=4: Handle -> slog dispatch -> slog.Info/Warn/etc -> caller.
 	h.logger.logTyped(level, h.logType, []byte(r.Message), 4, fields...)
 
-	// Return buffer to pool. Release oversized buffers to GC to avoid
-	// permanent retention of rare large-attribute records.
+	// Return buffer to pool. Release oversized buffers.
 	if cap(fields) > 256 {
 		*bp = make([]Field, 0, 32)
 	} else {
 		*bp = fields
 	}
 	h.fieldPool.Put(bp)
+
 	return nil
 }
 
-// WithAttrs implements slog.Handler. Returns a new handler whose records
-// include the given attributes. Attributes are converted to Fields once
-// here (cold path) and prepended on every Handle call.
+// WithAttrs implements slog.Handler.
 func (h *SlogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	if len(attrs) == 0 {
 		return h
 	}
-	// Pre-convert into a new slice (copy-on-write; parent handler unchanged).
+
 	newAttrs := make([]Field, 0, len(h.attrs)+len(attrs))
 	newAttrs = append(newAttrs, h.attrs...)
+
 	for i := range attrs {
-		newAttrs = append(newAttrs, h.convertAttr(attrs[i]))
+		newAttrs = h.appendAttr(newAttrs, attrs[i])
 	}
+
 	nh := *h
 	nh.attrs = newAttrs
 	return &nh
 }
 
-// WithGroup implements slog.Handler. Returns a new handler that prefixes
-// subsequent attribute keys with the group name. Nested groups produce
-// dotted keys (e.g., "outer.inner.key"). Empty group names are ignored
-// per the slog.Handler contract.
+// WithGroup implements slog.Handler.
+//
+// Nested groups produce dotted prefixes:
+//
+//	WithGroup("outer").WithGroup("inner")
+//
+// results in keys like:
+//
+//	"outer.inner.key"
 func (h *SlogHandler) WithGroup(name string) slog.Handler {
 	if name == "" {
 		return h
 	}
+
 	nh := *h
 	if h.group != "" {
 		nh.group = h.group + "." + name
@@ -147,122 +135,104 @@ func (h *SlogHandler) WithGroup(name string) slog.Handler {
 	return &nh
 }
 
-// convertAttr maps a slog.Attr to a loggerj.Field without boxing.
-// Applies the current group prefix as a dotted key. Handles all slog
-// Value kinds; Group values are flattened with dot notation; LogValuer
-// is resolved before conversion.
-func (h *SlogHandler) convertAttr(a slog.Attr) Field {
+// appendAttr converts one slog.Attr into zero or more loggerj Fields.
+//
+// Group attributes are flattened recursively into dotted keys.
+func (h *SlogHandler) appendAttr(buf []Field, a slog.Attr) []Field {
+	v := a.Value
+	if v.Kind() == slog.KindLogValuer {
+		v = v.Resolve()
+	}
+
+	// Empty attr key:
+	// - scalar values are skipped
+	// - groups are inlined
+	if a.Key == "" {
+		return appendSlogValue(buf, "", v)
+	}
+
 	key := a.Key
 	if h.group != "" {
 		key = h.group + "." + key
 	}
 
-	v := a.Value
-	// Resolve LogValuer (e.g., custom types implementing LogValue).
+	return appendSlogValue(buf, key, v)
+}
+
+// appendSlogValue appends typed loggerj fields for a slog.Value.
+//
+// slog.KindGroup is flattened recursively:
+//
+//	http.method
+//	http.request.id
+func appendSlogValue(buf []Field, key string, v slog.Value) []Field {
 	if v.Kind() == slog.KindLogValuer {
 		v = v.Resolve()
 	}
 
 	switch v.Kind() {
-	case slog.KindString:
-		return Str(key, v.String())
-	case slog.KindInt64:
-		return Int64(key, v.Int64())
-	case slog.KindUint64:
-		return Uint64(key, v.Uint64())
-	case slog.KindFloat64:
-		return Float64(key, v.Float64())
-	case slog.KindBool:
-		return Bool(key, v.Bool())
-	case slog.KindDuration:
-		return Dur(key, v.Duration())
-	case slog.KindTime:
-		// Render times as RFC3339 strings for stable JSON output.
-		return Str(key, v.Time().Format(time.RFC3339))
 	case slog.KindGroup:
-		// Flatten nested groups into dotted keys. Nested objects are not
-		// supported by the Field API; flattening preserves the data.
 		attrs := v.Group()
-		// Emit each sub-attr with a dotted key. Since Field is a single
-		// key-value, we collapse the group to its string form when it
-		// cannot be represented as one field.
-		if len(attrs) == 1 {
-			sub := attrs[0]
-			return Field{
-				Key:  key + "." + sub.Key,
-				Type: fieldKindOf(sub.Value),
-				Num:  fieldNumOf(sub.Value),
-				Str:  fieldStrOf(sub.Value),
+		if len(attrs) == 0 {
+			return buf
+		}
+
+		for i := range attrs {
+			subKey := attrs[i].Key
+
+			if key != "" {
+				if subKey == "" {
+					subKey = key
+				} else {
+					subKey = key + "." + subKey
+				}
 			}
-		}
-		// Multi-key group: fall back to string representation.
-		return Str(key, v.String())
-	default:
-		// KindAny and unknown kinds: string fallback.
-		return Str(key, v.String())
-	}
-}
 
-// fieldKindOf maps a slog.Value kind to a loggerj FieldType (group helper).
-func fieldKindOf(v slog.Value) FieldType {
+			buf = appendSlogValue(buf, subKey, attrs[i].Value)
+		}
+		return buf
+	}
+
+	// Scalar values with empty keys are skipped.
+	if key == "" {
+		return buf
+	}
+
 	switch v.Kind() {
 	case slog.KindString:
-		return StringType
-	case slog.KindInt64:
-		return Int64Type
-	case slog.KindUint64:
-		return Uint64Type
-	case slog.KindFloat64:
-		return Float64Type
-	case slog.KindBool:
-		return BoolType
-	case slog.KindDuration:
-		return DurationType
-	default:
-		return StringType
-	}
-}
+		return append(buf, Str(key, v.String()))
 
-// fieldNumOf extracts the numeric payload for a slog.Value (group helper).
-func fieldNumOf(v slog.Value) uint64 {
-	switch v.Kind() {
 	case slog.KindInt64:
-		return uint64(v.Int64())
-	case slog.KindUint64:
-		return v.Uint64()
-	case slog.KindFloat64:
-		return floatToBits(v.Float64())
-	case slog.KindBool:
-		if v.Bool() {
-			return 1
-		}
-		return 0
-	case slog.KindDuration:
-		return uint64(v.Duration())
-	default:
-		return 0
-	}
-}
+		return append(buf, Int64(key, v.Int64()))
 
-// fieldStrOf extracts the string payload for a slog.Value (group helper).
-func fieldStrOf(v slog.Value) string {
-	switch v.Kind() {
-	case slog.KindString:
-		return v.String()
+	case slog.KindUint64:
+		return append(buf, Uint64(key, v.Uint64()))
+
+	case slog.KindFloat64:
+		return append(buf, Float64(key, v.Float64()))
+
+	case slog.KindBool:
+		return append(buf, Bool(key, v.Bool()))
+
+	case slog.KindDuration:
+		return append(buf, Dur(key, v.Duration()))
+
 	case slog.KindTime:
-		return v.Time().Format(time.RFC3339)
+		// RFC3339Nano preserves sub-second precision for audit trails and
+		// distributed tracing correlation. RFC3339 silently drops nanoseconds.
+		return append(buf, Str(key, v.Time().Format(time.RFC3339Nano)))
+
 	default:
-		return v.String()
+		// KindAny and unknown kinds use string fallback.
+		return append(buf, Str(key, v.String()))
 	}
 }
 
 // -----------------------------------------------------------------------------
-// Level Mapping (slog ↔ loggerj)
+// Level Mapping (slog <-> loggerj)
 // -----------------------------------------------------------------------------
 
 // slogToLoggerjLevel maps a slog.Level to the nearest loggerj Level.
-// slog levels are spaced by 4 (Debug=-4, Info=0, Warn=4, Error=8) and
-// support custom intermediate levels; we map to the nearest bucket.
 func slogToLoggerjLevel(l slog.Level) Level {
 	switch {
 	case l < slog.LevelInfo:
@@ -276,8 +246,7 @@ func slogToLoggerjLevel(l slog.Level) Level {
 	}
 }
 
-// loggerjToSlogLevel maps a loggerj Level back to slog.Level for the
-// Enabled() comparison.
+// loggerjToSlogLevel maps a loggerj Level back to slog.Level.
 func loggerjToSlogLevel(l Level) slog.Level {
 	switch l {
 	case LevelDebug:

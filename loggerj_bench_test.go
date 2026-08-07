@@ -864,3 +864,75 @@ func BenchmarkSlogHandler_Handle(b *testing.B) {
 		_ = handler.Handle(context.Background(), r)
 	}
 }
+
+func BenchmarkLog_RateLimited_HighContention(b *testing.B) {
+	logger := NewLogger(Config{
+		FlushTimeout:  50 * time.Millisecond,
+		ChannelSize:   65536,
+		IncludeCaller: false,
+	})
+
+	// Single profile with the maximum exact packed-state limit.
+	// This keeps the benchmark inside the representable rate-limit range.
+	logger.RegisterSub("HOT", WithRateLimit(rlMaxExactLimit, time.Second))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go logger.StartWithWriter(ctx, io.Discard)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	// Slam all CPU cores into a single rate-limit state
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			logger.Log(LevelInfo, "HOT", []byte("message"))
+		}
+	})
+}
+
+// BenchmarkTimeNowUnixMilli isolates the vDSO cost of time.Now().UnixMilli()
+// on the host OS. This is the unavoidable baseline cost paid on every
+// rate-limited log call in the current design.
+func BenchmarkTimeNowUnixMilli(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = time.Now().UnixMilli()
+	}
+}
+
+// BenchmarkCheckAtomicRateLimit_WithoutTime isolates the pure CAS and
+// bitwise math cost of the rate limiter, completely excluding the
+// time.Now() syscall.
+func BenchmarkCheckAtomicRateLimit_WithoutTime(b *testing.B) {
+	p := &SubProfile{
+		rlLimit:    1_000_000,
+		rlWindowMs: 1000,
+		rlStartMs:  time.Now().UnixMilli(),
+	}
+	// Fixed timestamp prevents window transitions during the benchmark.
+	now := p.rlStartMs + 500
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = checkAtomicRateLimitAt(p, now)
+	}
+}
+
+// BenchmarkCheckAtomicRateLimit_RealWorld measures the actual hot-path
+// cost including the time.Now() vDSO call.
+func BenchmarkCheckAtomicRateLimit_RealWorld(b *testing.B) {
+	p := &SubProfile{
+		rlLimit:    1_000_000,
+		rlWindowMs: 1000,
+		rlStartMs:  time.Now().UnixMilli(),
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		// This calls time.Now() inside, exactly like the real hot-path.
+		_ = checkAtomicRateLimitAt(p, time.Now().UnixMilli())
+	}
+}

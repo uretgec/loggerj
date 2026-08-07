@@ -21,6 +21,7 @@ Comprehensive examples for all `loggerj` features, configurations, and the Pre-C
   - [7. Sampling \& Rate Limiting](#7-sampling--rate-limiting)
     - [Rate Limiting](#rate-limiting)
     - [Sampling](#sampling)
+    - [Sampling + Rate Limit Interaction](#sampling--rate-limit-interaction)
   - [8. Runtime Level Change](#8-runtime-level-change)
   - [9. Concurrent Usage \& Graceful Shutdown](#9-concurrent-usage--graceful-shutdown)
   - [10. Sync Mode (Audit Trails)](#10-sync-mode-audit-trails)
@@ -61,10 +62,10 @@ Comprehensive examples for all `loggerj` features, configurations, and the Pre-C
     - [Custom Context Keys](#custom-context-keys)
     - [Performance](#performance)
   - [19. slog.Handler Adapter (Go 1.21+ Ecosystem Integration)](#19-sloghandler-adapter-go-121-ecosystem-integration)
-    - [Basic Usage](#basic-usage-1)
+    - [Basic Usage Slog](#basic-usage-slog)
     - [WithAttrs and WithGroup](#withattrs-and-withgroup)
     - [Setting as Default slog Logger](#setting-as-default-slog-logger)
-    - [Performance Note](#performance-note-1)
+    - [Performance Note 1](#performance-note-1)
     - [Limitations](#limitations)
   - [20. Rate Limit Exact Counting Cap (v1.4.0)](#20-rate-limit-exact-counting-cap-v140)
   - [21. slog.Group Multi-Key Flattening (v1.4.0)](#21-sloggroup-multi-key-flattening-v140)
@@ -400,6 +401,39 @@ for i := 0; i < 10000; i++ {
 }
 // Only ~100 logs will be written.
 ```
+
+### Sampling + Rate Limit Interaction
+
+When a `SubProfile` has both `WithSampleRate` and `WithRateLimit`, the gates
+run in a fixed order: **sampling first, then rate limit**. This means the
+rate-limit counter counts **post-sampling traffic**, not raw attempts.
+
+```go
+logger.RegisterSub("API",
+    loggerj.WithSampleRate(10),      // 1 out of 10 logs pass sampling
+    loggerj.WithRateLimit(100, time.Second), // max 100 logs/sec (post-sampling)
+)
+```
+
+**Effective behavior:**
+
+- 1000 raw log attempts/sec → 100 pass sampling → 100 counted by rate limit → **100 logs/sec written**
+- The rate limit applies to the **sampled** traffic, not the raw attempts.
+
+When This Matters
+
+If you need rate limiting on **raw attempts** (before sampling), you have two options:
+
+1. **Use separate SubProfiles:** One for sampling, one for rate limiting. Route traffic accordingly.
+2. **Accept the semantic:** Understand that `WithRateLimit(100, time.Second)` means "100 logs/sec after sampling", not "100 raw attempts/sec".
+
+Why Fixed Order?
+
+Making the gate order configurable at runtime would add a branch to the hot path,
+violating loggerj's zero-cost guarantee. The order is fixed at compile-time
+for performance. If your use case requires rate-limiting raw attempts, consider
+using external rate limiting (e.g., `golang.org/x/time/rate`) before calling
+`logger.InfoString`.
 
 ---
 
@@ -1097,7 +1131,7 @@ logger.InfoString("HTTP", "request", "user_id", userID, "method", "GET")
 applications adopted to the `log/slog` standard benefit from loggerj's
 throughput without changing call sites.
 
-### Basic Usage
+### Basic Usage Slog
 
 ```go
 package main
@@ -1164,7 +1198,7 @@ slog.SetDefault(slog.New(handler))
 slog.Info("application started")
 ```
 
-### Performance Note
+### Performance Note 1
 
 ```txt
 BenchmarkSlogHandler_Handle-10    8,600,000    143 ns/op    0 B/op    0 allocs/op

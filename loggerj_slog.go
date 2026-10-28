@@ -80,14 +80,18 @@ func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
 	})
 
 	// Dispatch through the typed-field hot path.
-	// skip=4: Handle -> slog dispatch -> slog.Info/Warn/etc -> caller.
-	h.logger.logTyped(level, h.logType, []byte(r.Message), 4, fields...)
+	// r.PC is the exact call site recorded by slog; passing it avoids guessing
+	// a stack depth. logTyped copies the message before returning, so the
+	// zero-copy conversion is safe (a []byte(r.Message) conversion would
+	// allocate for messages longer than 32 bytes).
+	h.logger.logTyped(level, h.logType, unsafeStringToBytes(r.Message), 0, r.PC, fields...)
 
 	// Return buffer to pool. Release oversized buffers.
 	if cap(fields) > 256 {
 		*bp = make([]Field, 0, 32)
 	} else {
-		*bp = fields
+		clear(fields) // drop string references held by pooled elements
+		*bp = fields[:0]
 	}
 	h.fieldPool.Put(bp)
 

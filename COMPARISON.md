@@ -8,12 +8,12 @@ An engineering comparison. We show where `loggerj` wins, where it loses, and the
 
 ## Executive Summary
 
-- **High-throughput async services**: `loggerj` async is **2-3x faster than zap buffered-async** and **5-20x faster than sync loggers**.
-- **Sync / audit-critical logging**: `loggerj`'s `SyncMode` (OSBuffered tier) is **2-3x faster than zerolog sync** and explicitly documents its durability guarantees.
+- **High-throughput async services**: the async API has a low caller-side cost (see BENCH.md), but those numbers measure enqueueing an entry, not delivered logs. Competitor numbers include formatting and the write, so the two are not directly comparable. Run `BenchmarkE2E_*` (delivered throughput and `drops/op`) and your own workload before choosing.
+- **Sync / audit-critical logging**: `SyncMode` documents what each tier survives. `OSBuffered` is fast (~111 ns/op) because it does not issue a syscall per entry, so it does NOT survive a process crash for unflushed entries. The like-for-like comparison with zerolog/zap writing to a file is the `Direct` tier (~1.5 µs/op).
 - **Structured logging**: `loggerj`'s `Field` API gives **0 allocs/op** for dynamic values, matching zap and beating slog variadic call sites.
 - **slog ecosystem**: Native `slog.Handler` adapter routes calls through loggerj's pipeline (~143 ns/op, 0 allocs). Groups are flattened to dotted keys.
 - **logrus**: `loggerj` wins everywhere; `logrus` is in maintenance mode.
-- **No configurable gate order (sampling vs rate limit).** Rate limit ALWAYS runs before sampling. This is a fixed architectural decision to keep the hot path branch-free and to leverage fast-path rate-limit rejection (~0.3ns) to skip sampling CPU cost during floods. If you need sampling to apply to raw input *before* rate limiting, implement it at the call site.
+- **No configurable gate order (sampling vs rate limit).** In v1.4.x the rate limit runs before sampling. With both set, the rate limit counts entries before sampling, so the output is roughly `limit / sampleRate` per window, and every call pays one clock read (~34 ns) because the rate limiter runs first. v1.5.0 is planned to run sampling first (a behavior change); see ROADMAP.md.
 
 ---
 
@@ -27,11 +27,11 @@ An engineering comparison. We show where `loggerj` wins, where it loses, and the
 | **Typed fields (0 alloc)** | ✅ `Field` union | ✅ `zap.Field` | ✅ Fluent | ⚠️ Attr boxing | ❌ |
 | **Durability tiers (explicit)** | ✅ Documented | ⚠️ Implicit | ⚠️ Implicit | ❌ | ❌ |
 | **Lock-free rate limiting** | ✅ CAS, bounded backoff | ❌ | ❌ | ❌ | ❌ |
-| **Log rotation** | ⚠️ Size-based only, no compression, no time-based | ❌ lumberjack | ❌ lumberjack | ❌ | ❌ lumberjack |
+| **Log rotation** | ⚠️ Size-based only, async mode only, no compression, no time-based | ❌ lumberjack | ❌ lumberjack | ❌ | ❌ lumberjack |
 | **slog.Handler adapter** | ✅ Native | ✅ Bridge | ⚠️ Community | ✅ Native | ❌ |
 | **External dependencies** | ✅ **0** | 2 | ✅ 0 | ✅ 0 (stdlib) | 1 |
 
-> **Rotation scope note:** loggerj's built-in rotation is size-based only —
+> **Rotation scope note:** loggerj's built-in rotation is size-based only, and only in async mode (`MaxFileSize` is ignored in `SyncMode`) —
 > no time-based (daily) rotation, no gzip compression. This is a deliberate
 > subset of lumberjack's functionality, traded for zero external dependencies.
 > For production systems requiring daily rotation, compression, or remote
@@ -43,17 +43,17 @@ An engineering comparison. We show where `loggerj` wins, where it loses, and the
 
 ## Durability Tiers: The Honest Difference
 
-All sync loggers default to "OS-buffered": a single `write(2)` syscall that lands data in the kernel page cache. This survives process crashes but **NOT OS crashes or power loss**.
+Loggers that call `write(2)` once per entry (zap and zerolog writing to a file, loggerj `Direct`) leave the data in the kernel page cache: it survives a process crash but not an OS crash or power loss. loggerj's `SyncMode` makes the tier explicit and adds `fsync` tiers and two buffered tiers. The buffered tiers keep entries in process memory, which is why they are faster and why they lose entries on a process crash.
 
-`loggerj` is the only logger that explicitly documents this and offers `fsync`-based tiers.
-
-| Tier | Survives process crash | Survives OS crash / power loss | Throughput |
+| Tier | Survives process crash | Survives OS crash / power loss | Throughput (reference machine) |
 |---|---|---|---|
-| **loggerj OSBuffered** | ✅ Yes | ❌ No (page cache) | ~111 ns/op |
+| **loggerj OSBuffered** | ❌ Unflushed entries are lost (no background flush timer) | ❌ | ~111 ns/op (no syscall per entry) |
 | **loggerj Direct** | ✅ Yes | ❌ No (page cache) | ~1566 ns/op |
-| **loggerj FsyncEveryN** | ✅ Yes | ✅ Yes (every N logs) | ~5000 ns/op |
-| **loggerj FsyncEveryWrite** | ✅ Yes | ✅ Yes (every log) | ~4.4 ms/op |
-| zerolog / zap sync | ✅ Yes | ❌ No (not documented) | ~300-500 ns/op |
+| **loggerj FsyncEveryN** | ⚠️ Up to the last fsync; the last N-1 entries are lost | ✅ Up to the last fsync | see BENCH.md (`BenchmarkSyncMode_FsyncEveryN`) |
+| **loggerj FsyncEveryWrite** | ✅ Yes | ✅ Yes, if the disk honors fsync | ~4.4 ms/op |
+| zerolog / zap writing to a file | ✅ Yes | ❌ No | one `write(2)` per entry; compare with `Direct` |
+
+The process-crash column is verified by `TestDurability_ProcessKill` (SIGKILL on a helper process). The OS-crash column is not tested.
 
 ---
 
@@ -67,7 +67,10 @@ We believe in radical transparency. Here is every case where `loggerj` is **not*
 | **Nested structured logs** | No `zap.Object` or `zerolog.Dict()` equivalent. `Field` is a flat key-value tagged union. | **zap** or **zerolog** for deep nesting |
 | **Plugin / multi-sink composition** | No `zapcore.Core` equivalent (intentional). No tiered multi-sink. | **zap** for composable sinks |
 | **Production maturity** | v1.4.3 has comprehensive validation, but production track record is still limited compared to Uber's zap. | **zap** / **zerolog** for conservative teams |
-| **Strict per-log ordering** | Async channel can reorder under extreme load. | **zerolog** or **zap** (sync) |
+| **Delivery under overload / crash** | The async channel drops entries when full (counted in `Stats().Drops`), leaving gaps, and async mode gives no crash durability. | `SyncMode` (`Direct` / `FsyncEveryWrite`) |
+| **Timestamps** | In async mode `ts` is taken by the worker when it formats the entry, not when the log call is made; under backpressure it can lag the event. | **zap** / **zerolog** |
+| **Sync-mode rotation** | `MaxFileSize` / `MaxBackupFiles` are ignored in `SyncMode`. | logrotate (copytruncate) or lumberjack |
+| **Text-mode escaping** | Text output does not escape newlines or spaces in values; untrusted input can forge log lines. | Use `JSONOutput` for untrusted data |
 | **Rate-limit exact limit >16M** | Packed atomic state caps exact counting at 16,777,215 per window. | Use external rate limiter |
 
 ### Why No Nested JSON Objects?
@@ -84,11 +87,11 @@ Rate limits are bound to `SubProfile` at init-time (`RegisterSub`). This elimina
 
 | Scenario | Why `loggerj` wins | Gain |
 |---|---|---|
-| **API gateway / proxy** | Async + 0 alloc + pre-baked prefix | 5-20x throughput |
-| **High-QPS microservice** | Channel buffering absorbs bursts | No deadlock under load |
+| **API gateway / proxy** | Async + 0 alloc on the caller path + pre-baked prefix | Low caller-side cost (measure end-to-end) |
+| **High-QPS microservice** | Channel buffering absorbs bursts | Drops (counted) instead of blocking when full |
 | **Noisy rate-limited logs** | Lock-free CAS with bounded backoff | No mutex, no CPU spin |
 | **Zero-dependency policy** | Even rotation is hand-rolled | No supply-chain risk |
-| **GC-sensitive workloads** | Hot path truly 0 alloc | No GC pauses from logging |
+| **GC-sensitive workloads** | No heap allocation on the caller path in the documented APIs | Less GC pressure from logging |
 
 ---
 

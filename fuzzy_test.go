@@ -2,29 +2,23 @@ package loggerj
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 	"time"
 	"unicode/utf8"
 )
 
-// FuzzAppendJSONString verifies appendJSONString escaping correctness for
-// valid UTF-8 input.
-//
-// Invalid UTF-8 handling is intentionally not fuzzed in this first pass.
-// Current appendJSONString assumes valid UTF-8 for non-control bytes.
-// A follow-up correctness task should decide whether invalid UTF-8 must be
-// replaced with U+FFFD or escaped in some other RFC 8259 compatible way.
+// FuzzAppendJSONString verifies appendJSONString always emits valid JSON that
+// round-trips through encoding/json. Invalid UTF-8 bytes are replaced by
+// U+FFFD (one per invalid byte), exactly like encoding/json does.
 func FuzzAppendJSONString(f *testing.F) {
 	f.Add("hello")
 	f.Add("quote \" backslash \\ newline \n tab \t")
 	f.Add("control \x01 \x1f \x7f")
 	f.Add("unicode: çğıöşü")
+	f.Add("invalid: \xff\xfe \xc3")
 
 	f.Fuzz(func(t *testing.T, s string) {
-		if !utf8.ValidString(s) {
-			t.Skip("invalid UTF-8 is tracked separately")
-		}
-
 		out := appendJSONString(nil, s)
 
 		var got string
@@ -32,14 +26,39 @@ func FuzzAppendJSONString(f *testing.F) {
 			t.Fatalf("invalid JSON string: %v\ninput=%q\noutput=%q", err, s, out)
 		}
 
-		if got != s {
-			t.Fatalf("roundtrip mismatch\ninput=%q\ngot=%q", s, got)
+		// Converting to []rune replaces each invalid byte with U+FFFD.
+		if want := string([]rune(s)); got != want {
+			t.Fatalf("roundtrip mismatch\ninput=%q\ngot=%q\nwant=%q", s, got, want)
 		}
 	})
 }
 
-// FuzzAppendDuration verifies appendDuration never panics and emits non-empty
-// UTF-8 output for arbitrary duration values.
+// absDuration returns |d| in nanoseconds without overflowing on MinInt64.
+func absDuration(d time.Duration) uint64 {
+	if d < 0 {
+		return uint64(-(d + 1)) + 1
+	}
+	return uint64(d)
+}
+
+// durationTruncation returns the exclusive upper bound of the error that
+// appendDuration may introduce for a magnitude given in nanoseconds.
+func durationTruncation(ns uint64) uint64 {
+	switch {
+	case ns < uint64(time.Microsecond):
+		return 1 // exact
+	case ns < uint64(time.Millisecond):
+		return uint64(time.Microsecond)
+	case ns < uint64(time.Minute):
+		return uint64(time.Millisecond)
+	default:
+		return uint64(time.Second)
+	}
+}
+
+// FuzzAppendDuration verifies appendDuration emits output that
+// time.ParseDuration accepts and that differs from the input only by the
+// documented truncation.
 func FuzzAppendDuration(f *testing.F) {
 	f.Add(int64(0))
 	f.Add(int64(1))
@@ -50,16 +69,36 @@ func FuzzAppendDuration(f *testing.F) {
 	f.Add(int64(time.Second))
 	f.Add(int64(time.Minute))
 	f.Add(int64(time.Hour))
+	f.Add(int64(2005 * time.Millisecond))
+	f.Add(int64(100 * time.Hour))
+	f.Add(int64(math.MinInt64))
+	f.Add(int64(math.MaxInt64))
 
 	f.Fuzz(func(t *testing.T, n int64) {
-		out := appendDuration(nil, time.Duration(n))
+		d := time.Duration(n)
+		out := appendDuration(nil, d)
 
 		if len(out) == 0 {
 			t.Fatalf("empty duration output")
 		}
-
 		if !utf8.Valid(out) {
 			t.Fatalf("invalid UTF-8 duration output: %q", out)
+		}
+
+		parsed, err := time.ParseDuration(string(out))
+		if err != nil {
+			t.Fatalf("unparsable duration %q for %d: %v", out, n, err)
+		}
+
+		want, got := absDuration(d), absDuration(parsed)
+		if got > want {
+			t.Fatalf("%q parses to a larger magnitude than input %d", out, n)
+		}
+		if parsed != 0 && (d < 0) != (parsed < 0) {
+			t.Fatalf("%q has the wrong sign for input %d", out, n)
+		}
+		if want-got >= durationTruncation(want) {
+			t.Fatalf("%q loses too much precision for input %d", out, n)
 		}
 	})
 }

@@ -6,6 +6,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.4.4] - 2026-10-26
+
+Patch release: bug fixes and documentation corrections. The gate order (rate limit before sampling) is unchanged; switching to sampling first is planned for v1.5.0.
+
+### Documentation corrections
+
+- **Durability claims:** `OSBuffered` and `FsyncEveryN` do NOT survive a process crash for entries still in the buffer (there is no background flush timer, and the last N-1 `FsyncEveryN` entries are not fsynced). README, COMPARISON, EXAMPLES and godoc were corrected; a durability table was added to README.
+- **Gate order:** the v1.4.3 entry below, the `WithRateLimit` / `WithSampleRate` godoc and EXAMPLES §7 described the order backwards. The code has always run the rate limit first. Docs now match the code, including the worked example and the cost of the clock read.
+- **Fair comparisons:** removed the "2-3x faster than zerolog sync" and "5-20x" claims. `OSBuffered` has no syscall per entry; the async numbers are caller-side costs, not delivered throughput.
+- **Locking wording:** the channel send takes the Go runtime's lock and `os.File.Write` serializes writers internally, so "zero mutex" / "lock-free" claims were narrowed. Removed the incorrect PIPE_BUF statement and the "channel can reorder" row.
+- **Sync mode:** rotation is not supported (EXAMPLES §14 no longer shows it); the channel is no longer described as created.
+- **EXAMPLES:** the test helper no longer uses unexported fields; shutdown snippets use `Flush(); cancel(); Close()` order instead of `defer Close()` before `defer cancel()`.
+- **BENCH:** added "How to read the async numbers"; marked tables as v1.4.3 measurements; `logs/s` renamed `attempts/s`.
+
+### Fixes
+
+- **Rotation:** `MaxBackupFiles=N` now keeps N backups (it kept N-1; `1` kept none). A failed rename no longer truncates the live log; rotation is skipped and the file keeps being appended to.
+- **Sync mode:** no longer opens a second, never-closed file handle and no longer allocates the unused channel. `Flush()` now flushes the buffer of `OSBuffered` / `FsyncEveryN` (and fsyncs for `FsyncEveryN`); `Close()` fsyncs for `FsyncEveryN`. Failed buffered writes/flushes are counted in `Stats().SyncWriteErrors`. `FsyncEveryNCount` now defaults to 100 when 0 (it used to fsync on every write).
+- **Durations:** `2.005s` was printed as `2.5s`. Fractions are zero-padded, hours are supported, negative values are formatted correctly.
+- **JSON:** `NaN`/`±Inf` floats are emitted as strings (they produced invalid JSON); invalid UTF-8 bytes are escaped as `\ufffd`. The two JSON string encoders were merged into one.
+- **Rate limiter:** a goroutine holding a stale timestamp no longer resets a newer window.
+- **Context methods:** `DebugCtx`/`InfoCtx`/`WarnCtx`/`ErrorCtx` check the level before reading the context.
+- **slog adapter:** no allocation for messages longer than 32 bytes; the caller is taken from `Record.PC`; pooled field slices no longer retain string references.
+- **Text output:** no double space before the first field when leading fields are skipped.
+- **Pools:** `Entry.Reset` clears pooled slices so they do not keep large strings alive.
+
+### Testing
+
+- `TestDurability_ProcessKill`: a helper process writes in each tier and kills itself with SIGKILL; the parent counts surviving lines (Unix only).
+- Regression tests for every fix above; fuzz targets now check JSON round-trips for invalid UTF-8 and `time.ParseDuration` round-trips for durations.
+- Benchmarks report `drops/op`; added `BenchmarkE2E_*` and `BenchmarkSyncMode_FsyncEveryN`.
+- First measurements with `drops/op` (M1 Pro): ~80% of the attempts of the async benchmarks are dropped by the channel-full path; delivered throughput of a saturating producer is ~3M entries/s (see BENCH.md).
+
+### Known limitations (planned for v1.5.0, not changed here)
+
+- `Close()` does not stop the worker, and `Flush()` before the worker goroutine has started discards entries silently.
+- Async timestamps are taken when the worker formats the entry.
+- Text output does not escape newlines.
+
+---
+
 ## [1.4.3] - 2026-08-07
 
 ### Documentation Fixes

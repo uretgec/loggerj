@@ -31,6 +31,7 @@ func BenchmarkLog_NoFields(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		logger.Log(LevelInfo, "TEST", []byte("message"))
 	}
+	reportDrops(b, logger)
 }
 
 // BenchmarkLog_VeryLongMessage measures the cost of a 10KB message.
@@ -57,6 +58,7 @@ func BenchmarkLog_VeryLongMessage(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		logger.Log(LevelInfo, "TEST", []byte(veryLongMsg))
 	}
+	reportDrops(b, logger)
 }
 
 // -----------------------------------------------------------------------------
@@ -81,6 +83,7 @@ func BenchmarkLog_WithFields(b *testing.B) {
 		logger.Log(LevelInfo, "TEST", []byte("message"),
 			"key1", "value1", "key2", "value2")
 	}
+	reportDrops(b, logger)
 }
 
 // -----------------------------------------------------------------------------
@@ -106,6 +109,7 @@ func BenchmarkLog_JSON(b *testing.B) {
 		logger.Log(LevelInfo, "TEST", []byte("message"),
 			"key1", "value1", "key2", "value2")
 	}
+	reportDrops(b, logger)
 }
 
 // -----------------------------------------------------------------------------
@@ -129,6 +133,7 @@ func BenchmarkLog_WithCaller(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		logger.Log(LevelInfo, "TEST", []byte("message"))
 	}
+	reportDrops(b, logger)
 }
 
 // -----------------------------------------------------------------------------
@@ -157,6 +162,7 @@ func BenchmarkLog_RateLimited(b *testing.B) {
 		// No limit parameter passed; the SubProfile enforces it atomically.
 		logger.Log(LevelInfo, "TEST", []byte("message"))
 	}
+	reportDrops(b, logger)
 }
 
 // -----------------------------------------------------------------------------
@@ -182,6 +188,7 @@ func BenchmarkLog_Parallel(b *testing.B) {
 			logger.Log(LevelInfo, "TEST", []byte("message"))
 		}
 	})
+	reportDrops(b, logger)
 }
 
 // -----------------------------------------------------------------------------
@@ -207,6 +214,7 @@ func BenchmarkLevelHelpers(b *testing.B) {
 			logger.Info("TEST", []byte("message"), "key", "value")
 		}
 	})
+	reportDrops(b, logger)
 }
 
 // -----------------------------------------------------------------------------
@@ -239,6 +247,7 @@ func BenchmarkLog_ManyFields(b *testing.B) {
 			"key8", "value8",
 		)
 	}
+	reportDrops(b, logger)
 }
 
 // -----------------------------------------------------------------------------
@@ -266,6 +275,7 @@ func BenchmarkLog_LongMessage(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		logger.Log(LevelInfo, "TEST", []byte(longMsg))
 	}
+	reportDrops(b, logger)
 }
 
 // -----------------------------------------------------------------------------
@@ -293,6 +303,7 @@ func BenchmarkLog_Filtered(b *testing.B) {
 		// INFO is below ERROR threshold — filtered in ~2ns/op
 		logger.Log(LevelInfo, "TEST", []byte("message"))
 	}
+	reportDrops(b, logger)
 }
 
 // -----------------------------------------------------------------------------
@@ -314,6 +325,7 @@ func BenchmarkLog_Dropped(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		logger.Log(LevelInfo, "TEST", []byte("message"))
 	}
+	reportDrops(b, logger)
 }
 
 // -----------------------------------------------------------------------------
@@ -337,6 +349,7 @@ func BenchmarkLog_StringAPI(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		logger.InfoString("TEST", "message", "key1", "value1")
 	}
+	reportDrops(b, logger)
 }
 
 // -----------------------------------------------------------------------------
@@ -362,6 +375,7 @@ func BenchmarkLog_LargeBuffer(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		logger.Log(LevelInfo, "TEST", []byte("message"))
 	}
+	reportDrops(b, logger)
 }
 
 func BenchmarkLog_SmallBuffer(b *testing.B) {
@@ -383,6 +397,7 @@ func BenchmarkLog_SmallBuffer(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		logger.Log(LevelInfo, "TEST", []byte("message"))
 	}
+	reportDrops(b, logger)
 }
 
 // -----------------------------------------------------------------------------
@@ -407,6 +422,7 @@ func BenchmarkLog_JSON_NoEscape(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		logger.Log(LevelInfo, "TEST", []byte("simple message without special chars"))
 	}
+	reportDrops(b, logger)
 }
 
 func BenchmarkLog_JSON_WithEscape(b *testing.B) {
@@ -427,6 +443,7 @@ func BenchmarkLog_JSON_WithEscape(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		logger.Log(LevelInfo, "TEST", []byte("message with \"quotes\" and \\backslash"))
 	}
+	reportDrops(b, logger)
 }
 
 // =============================================================================
@@ -462,6 +479,7 @@ func BenchmarkLog_SubProfile_Prefix(b *testing.B) {
 		// Only dynamic fields are passed; pre-baked prefixes are injected automatically.
 		logger.Log(LevelInfo, "API", []byte("request received"), "path", "/api/v1/users")
 	}
+	reportDrops(b, logger)
 }
 
 // -----------------------------------------------------------------------------
@@ -489,6 +507,7 @@ func BenchmarkLog_Sampling(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		logger.Log(LevelInfo, "SAMPLE", []byte("sampled message"))
 	}
+	reportDrops(b, logger)
 }
 
 // -----------------------------------------------------------------------------
@@ -517,6 +536,7 @@ func BenchmarkLog_SyncEquivalent(b *testing.B) {
 		logger.Log(LevelInfo, "TEST", []byte("message"))
 		logger.Flush()
 	}
+	reportDrops(b, logger)
 }
 
 // -----------------------------------------------------------------------------
@@ -524,10 +544,10 @@ func BenchmarkLog_SyncEquivalent(b *testing.B) {
 
 // The write strategy depends on `DurabilityTier`:
 
-// - **OSBuffered / FsyncEveryN:** shared `bufio.Writer` protected by a brief
-//   mutex (held only during the buffer copy, not the syscall). Not lock-free.
+// - **OSBuffered / FsyncEveryN:** shared `bufio.Writer` protected by a mutex
+//   that is held during the buffer copy AND the flush/fsync. Not lock-free.
 // - **Direct / FsyncEveryWrite:** one `write(2)` per entry to an `O_APPEND`
-//   file handle. No mutex on the write path.
+//   file handle. No loggerj mutex (os.File.Write serializes internally).
 // -----------------------------------------------------------------------------
 
 // BenchmarkSyncMode_NoFields measures sync-mode performance with no fields.
@@ -569,7 +589,8 @@ func BenchmarkSyncMode_TypedFields(b *testing.B) {
 }
 
 // BenchmarkSyncMode_Parallel measures sync-mode under concurrent load.
-// O_APPEND guarantees no mutex contention; throughput should scale with cores.
+// The default tier (OSBuffered) serializes on syncMu, so throughput does not
+// scale with cores; see BENCH.md.
 func BenchmarkSyncMode_Parallel(b *testing.B) {
 	tmpDir := b.TempDir()
 	logger := NewLogger(Config{
@@ -588,7 +609,7 @@ func BenchmarkSyncMode_Parallel(b *testing.B) {
 }
 
 // BenchmarkSyncMode_OSBuffered measures OSBuffered tier throughput.
-// Target: ~300ns/op (competitive with zerolog/zap sync mode).
+// No syscall per entry: do not compare with loggers that write(2) per entry.
 func BenchmarkSyncMode_OSBuffered(b *testing.B) {
 	tmpDir := b.TempDir()
 	logger := NewLogger(Config{
@@ -667,6 +688,7 @@ func BenchmarkTypedFields(b *testing.B) {
 			Str("method", "GET"),
 		)
 	}
+	reportDrops(b, logger)
 }
 
 // BenchmarkTypedFields_String compares typed vs string-field API overhead.
@@ -692,6 +714,7 @@ func BenchmarkTypedFields_String(b *testing.B) {
 			"cached", "true",
 			"method", "GET")
 	}
+	reportDrops(b, logger)
 }
 
 // BenchmarkTypedFields_Dynamic shows the REAL advantage: when the caller
@@ -723,6 +746,7 @@ func BenchmarkTypedFields_Dynamic(b *testing.B) {
 			Str("method", method),
 		)
 	}
+	reportDrops(b, logger)
 }
 
 // -----------------------------------------------------------------------------
@@ -753,6 +777,7 @@ func BenchmarkGetProfile_SmallRegistry(b *testing.B) {
 		logType := fmt.Sprintf("TYPE_%d", i%8)
 		logger.Info(logType, []byte("msg"))
 	}
+	reportDrops(b, logger)
 }
 
 // BenchmarkGetProfile_LargeRegistry measures map-based O(1) lookup for
@@ -781,6 +806,7 @@ func BenchmarkGetProfile_LargeRegistry(b *testing.B) {
 		logType := fmt.Sprintf("TYPE_%d", i%200)
 		logger.Info(logType, []byte("msg"))
 	}
+	reportDrops(b, logger)
 }
 
 // BenchmarkGetProfile_LinearScanDirect isolates the pure linear-scan
@@ -839,6 +865,7 @@ func BenchmarkSlogHandler(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		slogger.Info("request", "method", "GET", "status", 200)
 	}
+	reportDrops(b, logger)
 }
 
 // BenchmarkSlogHandler_Handle isolates the Handle() method cost by
@@ -863,6 +890,7 @@ func BenchmarkSlogHandler_Handle(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_ = handler.Handle(context.Background(), r)
 	}
+	reportDrops(b, logger)
 }
 
 func BenchmarkLog_RateLimited_HighContention(b *testing.B) {
@@ -889,6 +917,7 @@ func BenchmarkLog_RateLimited_HighContention(b *testing.B) {
 			logger.Log(LevelInfo, "HOT", []byte("message"))
 		}
 	})
+	reportDrops(b, logger)
 }
 
 // BenchmarkTimeNowUnixMilli isolates the vDSO cost of time.Now().UnixMilli()
@@ -935,4 +964,88 @@ func BenchmarkCheckAtomicRateLimit_RealWorld(b *testing.B) {
 		// This calls time.Now() inside, exactly like the real hot-path.
 		_ = checkAtomicRateLimitAt(p, time.Now().UnixMilli())
 	}
+}
+
+// -----------------------------------------------------------------------------
+// v1.4.4: drop reporting, end-to-end throughput, FsyncEveryN
+// -----------------------------------------------------------------------------
+
+// reportDrops reports how many of the b.N attempts were dropped because the
+// channel was full. ns/op of the async benchmarks above is the caller-side
+// cost of an attempt; when drops/op is not 0, part of that time is the cheap
+// drop path and the numbers are not delivered-log costs. Level, sampling and
+// rate-limit rejections are not drops and are not counted here.
+func reportDrops(b *testing.B, l *Logger) {
+	b.ReportMetric(float64(l.Drops())/float64(b.N), "drops/op")
+}
+
+// benchmarkE2E measures delivered throughput: it includes the worker drain
+// (Flush) in the timed region and reports the drop ratio and the number of
+// entries actually delivered per second.
+func benchmarkE2E(b *testing.B, cfg Config, logFn func(l *Logger)) {
+	logger := NewLogger(cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go logger.StartWithWriter(ctx, io.Discard)
+	<-logger.started
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		logFn(logger)
+	}
+	logger.Flush()
+	elapsed := b.Elapsed()
+	b.StopTimer()
+
+	drops := logger.Drops()
+	delivered := uint64(b.N) - drops
+	b.ReportMetric(float64(drops)/float64(b.N), "drops/op")
+	if elapsed > 0 {
+		b.ReportMetric(float64(delivered)/elapsed.Seconds(), "delivered/s")
+	}
+}
+
+func BenchmarkE2E_NoFields_Text(b *testing.B) {
+	benchmarkE2E(b, Config{
+		FlushTimeout: 50 * time.Millisecond,
+		ChannelSize:  4096,
+	}, func(l *Logger) {
+		l.Log(LevelInfo, "TEST", []byte("message"))
+	})
+}
+
+func BenchmarkE2E_TypedFields_JSON(b *testing.B) {
+	status, latency := 200, 50*time.Millisecond
+	benchmarkE2E(b, Config{
+		JSONOutput:   true,
+		FlushTimeout: 50 * time.Millisecond,
+		ChannelSize:  4096,
+	}, func(l *Logger) {
+		l.InfoFields("HTTP", []byte("request"),
+			Int("status", status),
+			Dur("latency", latency),
+			Bool("cached", true),
+			Str("method", "GET"),
+		)
+	})
+}
+
+// BenchmarkSyncMode_FsyncEveryN measures the FsyncEveryN tier (fsync every
+// 100 entries).
+func BenchmarkSyncMode_FsyncEveryN(b *testing.B) {
+	tmpDir := b.TempDir()
+	logger := NewLogger(Config{
+		SyncMode:         true,
+		OutputFile:       tmpDir + "/bench.log",
+		DurabilityTier:   FsyncEveryN,
+		FsyncEveryNCount: 100,
+	})
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		logger.InfoString("TEST", "fsync-n message")
+	}
+	b.StopTimer()
+	logger.Close()
 }

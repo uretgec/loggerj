@@ -31,9 +31,19 @@ Theme: **Trust, Validation, Completeness.** (v1.4.0 through v1.4.3)
 
 ---
 
+## ✅ v1.4.4 — Completed
+
+Theme: **Correctness of docs and sync mode.** See CHANGELOG.md for the list. Behavior of the gate order was intentionally not changed.
+
+---
+
 ## 🔮 v1.5.0 — Future
 
 Theme: **Ecosystem Integration & Production Durability.**
+
+### Phase 0: Gate Order — Sampling First (decided)
+
+- [ ] **Run sampling before the rate limit.** Sampling then costs one atomic add, the clock read is only paid for sampled entries, and `WithRateLimit` caps the output (`min(input/sampleRate, limit)`). This changes the output of profiles that use both options, so it is a behavior change: update `TestLog_RateLimitAndSampling_Order`, godoc, EXAMPLES §7 and COMPARISON, and call it out in the changelog.
 
 ### Phase 1: Coarse-Time Cache (P0)
 
@@ -59,6 +69,16 @@ Theme: **Ecosystem Integration & Production Durability.**
 
 - [ ] **Multi-writer fan-out** — `Config.Writers []io.Writer` for simultaneous stderr + file + network output.
 - [ ] **Network shipping** — Optional `loggerj/network` sub-package for TCP/UDP log shipping.
+
+### Candidates from the v1.4.3 review (not decided yet)
+
+- [ ] `Close()` stops and waits for the worker (idempotent); a way to wait for worker start so `Flush()` cannot discard entries.
+- [ ] Cheaper rate-limit clock (monotonic `time.Since` instead of `time.Now`) before considering a coarse-time cache.
+- [ ] Per-profile handle API (`logger.Sub(...)`) to skip the profile lookup and avoid typos in the log type.
+- [ ] Escape newlines in text output; reserved-key check in `WithFields`.
+- [ ] Per-level drop counters or an option to never drop errors.
+- [ ] Defer caller resolution (`runtime.Callers` PC) to the worker.
+- [ ] Numeric durations in JSON and a configurable timestamp format.
 
 ### Deferred (Research Only)
 

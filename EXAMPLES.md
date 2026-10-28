@@ -36,7 +36,7 @@ Comprehensive examples for all `loggerj` features, configurations, and the Pre-C
   - [12. Error Context \& Structured Fields](#12-error-context--structured-fields)
   - [13. Custom Writer \& Test Helper](#13-custom-writer--test-helper)
     - [Custom Writer (e.g., Kafka)](#custom-writer-eg-kafka)
-    - [Test Helper (Deterministic, No Sleeps)](#test-helper-deterministic-no-sleeps)
+    - [Test Helper](#test-helper)
   - [14. Production Configurations](#14-production-configurations)
     - [Standard Production Config](#standard-production-config)
     - [Low-Resource Config (e.g., 512MB RAM, 1 CPU)](#low-resource-config-eg-512mb-ram-1-cpu)
@@ -108,9 +108,12 @@ func main() {
 
     // 3. Start the async worker
     ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
     go logger.Start(ctx)
-    defer logger.Close()
+    defer func() {
+        logger.Flush() // drain the channel while the worker is running
+        cancel()       // stop the worker
+        logger.Close() // close the file
+    }()
 
     // 4. Log messages (HOT PATH: Ultra-fast, zero allocation)
     // The "HTTP" type automatically gets the rate limit and prefix fields applied!
@@ -134,9 +137,12 @@ logger := loggerj.NewLogger(loggerj.Config{
 })
 
 ctx, cancel := context.WithCancel(context.Background())
-defer cancel()
 go logger.Start(ctx)
-defer logger.Close()
+defer func() {
+    logger.Flush() // drain the channel while the worker is running
+    cancel()       // stop the worker
+    logger.Close() // close the file
+}()
 
 // String API (Recommended for 99% of use cases)
 logger.InfoString("STARTUP", "Server initialized")
@@ -345,11 +351,14 @@ logger := loggerj.NewLogger(loggerj.Config{
 })
 
 ctx, cancel := context.WithCancel(context.Background())
-defer cancel()
 go logger.Start(ctx)
-defer logger.Close()
+defer func() {
+    logger.Flush() // drain the channel while the worker is running
+    cancel()       // stop the worker
+    logger.Close() // close the file
+}()
 
-// Logs will rotate automatically:
+// Logs will rotate automatically (async mode only; SyncMode ignores MaxFileSize):
 // myapp.log → myapp.log.1 → myapp.log.2 → ... → myapp.log.5 → (deleted)
 ```
 
@@ -405,35 +414,31 @@ for i := 0; i < 10000; i++ {
 ### Sampling + Rate Limit Interaction
 
 When a `SubProfile` has both `WithSampleRate` and `WithRateLimit`, the gates
-run in a fixed order: **sampling first, then rate limit**. This means the
-rate-limit counter counts **post-sampling traffic**, not raw attempts.
+run in a fixed order in v1.4.x: **rate limit first, then sampling**. The
+rate-limit counter counts entries *before* sampling, and sampling then keeps
+1 out of N of the admitted entries.
 
 ```go
 logger.RegisterSub("API",
-    loggerj.WithSampleRate(10),      // 1 out of 10 logs pass sampling
-    loggerj.WithRateLimit(100, time.Second), // max 100 logs/sec (post-sampling)
+    loggerj.WithRateLimit(100, time.Second), // admit at most 100 entries/sec
+    loggerj.WithSampleRate(10),              // then write 1 out of 10 of those
 )
 ```
 
-**Effective behavior:**
+**Effective behavior (v1.4.x):**
 
-- 1000 raw log attempts/sec → 100 pass sampling → 100 counted by rate limit → **100 logs/sec written**
-- The rate limit applies to the **sampled** traffic, not the raw attempts.
+- 500 raw log attempts/sec → 100 admitted by the rate limit → 10 written → **~10 logs/sec written**
+- The rate limit is therefore NOT a cap on the output when sampling is also set.
 
-When This Matters
+If you want "at most N written per second", you have two options:
 
-If you need rate limiting on **raw attempts** (before sampling), you have two options:
+1. Set the rate limit to `N * sampleRate` (here `WithRateLimit(1000, time.Second)` for ~100 written/sec at a sample rate of 10).
+2. Use separate SubProfiles, or an external limiter (e.g. `golang.org/x/time/rate`) before the call.
 
-1. **Use separate SubProfiles:** One for sampling, one for rate limiting. Route traffic accordingly.
-2. **Accept the semantic:** Understand that `WithRateLimit(100, time.Second)` means "100 logs/sec after sampling", not "100 raw attempts/sec".
-
-Why Fixed Order?
-
-Making the gate order configurable at runtime would add a branch to the hot path,
-violating loggerj's zero-cost guarantee. The order is fixed at compile-time
-for performance. If your use case requires rate-limiting raw attempts, consider
-using external rate limiting (e.g., `golang.org/x/time/rate`) before calling
-`logger.InfoString`.
+Because the rate limiter runs first, every call on such a profile pays one clock
+read (~34 ns) even if sampling would have discarded it. v1.5.0 is planned to run
+sampling first, which would make the example above yield `min(500/10, 100) = 50`
+logs/sec; see ROADMAP.md.
 
 ---
 
@@ -516,7 +521,7 @@ For scenarios requiring **per-log write guarantees** (audit trails, financial lo
 
 ### OSBuffered (Default)
 
-Buffered writes with periodic flush (~10ms). **2.7x faster than zerolog sync** (~112 ns/op vs ~300 ns/op).
+Writes go to a shared 64KB buffer (a memory copy, no syscall: ~112 ns/op on the reference machine). The buffer is flushed when it is nearly full, or when a later log call sees that 10ms have passed since the last flush. There is no background timer. Do not compare this number with loggers that call `write(2)` per entry; compare `Direct`.
 
 ```go
 logger := loggerj.NewLogger(loggerj.Config{
@@ -533,12 +538,13 @@ logger.InfoFields("AUDIT", []byte("user login"),
     loggerj.Dur("latency", 50*time.Millisecond),
 )
 
-// Graceful shutdown: Flush() is a no-op (already sync), but Close() persists all buffered data
+// Flush() writes the buffer to the file; Close() flushes and closes it.
+logger.Flush()
 logger.Close()
 ```
 
-**Survives:** Process crash  
-**Does NOT survive:** OS crash / power loss (data may still be in page cache)
+**Survives a process crash:** only entries already flushed. Entries still in the buffer are lost on panic/SIGKILL/OOM.  
+**Does NOT survive:** OS crash / power loss (flushed data may still be in the page cache)
 
 ### Direct (Per-Log Guarantee)
 
@@ -580,8 +586,9 @@ for i := 0; i < 1000; i++ {
 logger.Close()
 ```
 
-**Survives:** Process crash + OS crash / power loss (for committed entries)  
-**Throughput:** ~5000 ns/op (fsync latency amortized)
+**Survives an OS crash / power loss:** entries up to the last fsync.  
+**Process crash:** the entries after the last fsync (up to N-1) are still in the buffer and are lost. `Flush()` and `Close()` flush and fsync the buffer.  
+**Throughput:** run `BenchmarkSyncMode_FsyncEveryN` (depends heavily on the disk)
 
 ### FsyncEveryWrite (Maximum Durability)
 
@@ -610,8 +617,8 @@ logger.Close()
 |----------|------------------|-----|
 | High-volume application logs | **Async mode** (default) | Maximum throughput, acceptable if some logs lost on crash |
 | Audit trails (low volume) | **FsyncEveryWrite** | Every log must survive power loss |
-| Financial transactions | **FsyncEveryN** (N=10-100) | Balance durability and throughput |
-| General logging with sync guarantee | **OSBuffered** | Fast, survives process crash |
+| Financial transactions | **FsyncEveryN** (N=10-100) | Balance durability and throughput; up to N-1 entries are lost on a process crash, so call `Flush()` at checkpoints |
+| Fast sync logging, loss of the unflushed tail is acceptable | **OSBuffered** | Fast (no syscall per entry); call `Flush()`/`Close()` at checkpoints and shutdown |
 | Debug logs with immediate visibility | **Direct** | No buffering delay |
 
 ---
@@ -709,29 +716,52 @@ func (w *KafkaWriter) Write(p []byte) (n int, err error) {
 // go logger.StartWithWriter(ctx, kafkaWriter)
 ```
 
-### Test Helper (Deterministic, No Sleeps)
+### Test Helper
+
+Outside the `loggerj` package there is no exported way to wait for the worker to
+start, and `Flush()` discards pending entries if it runs before the worker
+goroutine (see `Flush`). The helper below therefore waits briefly after starting
+the worker. Tests inside the `loggerj` package can use the unexported `started`
+channel instead of sleeping.
 
 ```go
 package testutil
 
 import (
-    "bytes"
     "context"
     "strings"
+    "sync"
     "time"
 
     "github.com/uretgec/loggerj"
 )
 
+// syncBuffer is a goroutine-safe io.Writer (the worker writes while tests read).
+type syncBuffer struct {
+    mu  sync.Mutex
+    buf strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+    return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+    return b.buf.String()
+}
+
 type TestLogger struct {
     Logger *loggerj.Logger
-    Buffer *bytes.Buffer
+    buf    *syncBuffer
     cancel context.CancelFunc
-    done   chan struct{}
 }
 
 func NewTestLogger() *TestLogger {
-    buf := &bytes.Buffer{}
+    buf := &syncBuffer{}
     logger := loggerj.NewLogger(loggerj.Config{
         JSONOutput:   true,
         FlushTimeout: 10 * time.Millisecond,
@@ -740,28 +770,20 @@ func NewTestLogger() *TestLogger {
 
     ctx, cancel := context.WithCancel(context.Background())
     go logger.StartWithWriter(ctx, buf)
+    time.Sleep(10 * time.Millisecond) // let the worker goroutine start
 
-    // Block until the worker is ready — no time.Sleep needed
-    <-logger.started
-
-    return &TestLogger{
-        Logger: logger,
-        Buffer: buf,
-        cancel: cancel,
-        done:   logger.workerDone,
-    }
+    return &TestLogger{Logger: logger, buf: buf, cancel: cancel}
 }
 
 func (t *TestLogger) Close() {
-    t.Logger.Flush()       // 1. Write all pending entries
-    t.cancel()             // 2. Signal worker to stop
-    <-t.done               // 3. Wait for worker to exit (deterministic)
-    t.Logger.Close()       // 4. Release file handles
+    t.Logger.Flush() // 1. Write all pending entries
+    t.cancel()       // 2. Stop the worker
+    t.Logger.Close() // 3. Release file handles
 }
 
 func (t *TestLogger) Contains(s string) bool {
     t.Logger.Flush()
-    return strings.Contains(t.Buffer.String(), s)
+    return strings.Contains(t.buf.String(), s)
 }
 ```
 
@@ -817,13 +839,13 @@ logger := loggerj.NewLogger(loggerj.Config{
 
 ```go
 logger := loggerj.NewLogger(loggerj.Config{
-    SyncMode:         true,
-    OutputFile:       "/var/log/audit.log",
-    DurabilityTier:   loggerj.FsyncEveryN,
-    FsyncEveryNCount: 10,  // fsync every 10 logs
-    JSONOutput:       true,
-    MaxFileSize:      50 * 1024 * 1024,  // 50 MB
-    MaxBackupFiles:   30,                // Keep 30 days
+    SyncMode:       true,
+    OutputFile:     "/var/log/audit.log",
+    DurabilityTier: loggerj.FsyncEveryWrite, // every entry is fsynced before the call returns
+    JSONOutput:     true,
+    // MaxFileSize / MaxBackupFiles are NOT supported in SyncMode and would be
+    // ignored. Rotate externally (e.g. logrotate with copytruncate; lines
+    // written during the copy can be lost) or write through lumberjack.
 })
 
 // No Start() needed — sync mode writes directly
@@ -831,8 +853,13 @@ logger.InfoFields("AUDIT", []byte("user login"),
     loggerj.Str("user_id", "12345"),
     loggerj.Str("ip", "192.168.1.50"),
 )
-logger.Close()  // Flushes all buffered data before closing
+logger.Close()
 ```
+
+`FsyncEveryN` (e.g. `FsyncEveryNCount: 10`) is faster, but up to N-1 entries
+written after the last fsync are still in process memory and are lost on a
+process crash. If you use it, call `Flush()` at the points where you need the
+entries to be durable; `Flush()` and `Close()` flush and fsync.
 
 ---
 
@@ -905,9 +932,12 @@ func main() {
     })
 
     ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
     go logger.Start(ctx)
-    defer logger.Close()
+    defer func() {
+        logger.Flush() // drain the channel while the worker is running
+        cancel()       // stop the worker
+        logger.Close() // close the file
+    }()
 
     // 2. Redirect standard log to loggerj
     // CRITICAL: Disable std log's default flags (date/time) to avoid duplicate
@@ -1036,6 +1066,7 @@ if stats.SyncWriteErrors > 0 {
 - File handle was closed externally
 - OS-level I/O error (e.g., NFS mount lost)
 - `fsync()` failed (hardware issue)
+- Flushing the buffer of the `OSBuffered` / `FsyncEveryN` tiers failed
 
 Every failed write is also logged to `stderr` with tier information:
 
@@ -1152,9 +1183,12 @@ func main() {
     })
 
     ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
     go logger.Start(ctx)
-    defer logger.Close()
+    defer func() {
+        logger.Flush() // drain the channel while the worker is running
+        cancel()       // stop the worker
+        logger.Close() // close the file
+    }()
 
     // 2. Create slog.Handler wrapping loggerj
     handler := loggerj.NewSlogHandler(logger, "APP")
@@ -1215,7 +1249,7 @@ union that maps directly to loggerj's `Field` struct.
   `"http.request.method"` as a single key, not `{"http":{"request":{"method":...}}}`.
 - **Level mapping is bucket-based** — slog's custom intermediate levels (e.g.,
   `slog.Level(2)`) map to the nearest loggerj level (`LevelInfo`).
-- **Time values render as RFC3339 strings** — for stable JSON output. If you
+- **Time values render as RFC3339Nano strings** — for stable JSON output. If you
   need Unix timestamps, use `Int64("ts", time.Now().Unix())` instead.
 
 ---
@@ -1240,9 +1274,12 @@ logger.RegisterSub("HIGH_VOLUME", loggerj.WithRateLimit(20_000_000, time.Second)
 // Capped: effectively 16,777,215 logs per second
 
 ctx, cancel := context.WithCancel(context.Background())
-defer cancel()
 go logger.Start(ctx)
-defer logger.Close()
+defer func() {
+    logger.Flush() // drain the channel while the worker is running
+    cancel()       // stop the worker
+    logger.Close() // close the file
+}()
 
 // Both profiles work correctly, but HIGH_VOLUME is capped at 16,777,215
 for i := 0; i < 25_000_000; i++ {
@@ -1281,9 +1318,12 @@ logger := loggerj.NewLogger(loggerj.Config{
 })
 
 ctx, cancel := context.WithCancel(context.Background())
-defer cancel()
 go logger.Start(ctx)
-defer logger.Close()
+defer func() {
+    logger.Flush() // drain the channel while the worker is running
+    cancel()       // stop the worker
+    logger.Close() // close the file
+}()
 
 handler := loggerj.NewSlogHandler(logger, "APP")
 slogger := slog.New(handler)

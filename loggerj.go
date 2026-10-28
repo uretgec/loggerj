@@ -1,7 +1,8 @@
-// Package loggerj provides an ultra-high-performance, asynchronous, and lock-free
-// logging facility designed for high-throughput Go services. It offers zero heap
-// allocations in the hot path, atomic rate limiting, log rotation, and structured
-// fields in both text and JSON formats.
+// Package loggerj provides a high-throughput, asynchronous logging facility for
+// Go services. The documented logging APIs avoid heap allocations on the
+// caller's goroutine, rate limiting uses a lock-free atomic state, and the
+// package ships size-based log rotation and structured fields in both text
+// and JSON formats.
 //
 // # Architecture: Pre-Compiled Execution Profiles
 //
@@ -14,19 +15,24 @@
 //     counters for rate limiting and sampling. Profiles are stored in an
 //     immutable copy-on-write registry accessed via atomic.Pointer, ensuring
 //     zero interface boxing and zero map lookups in the hot path.
-//  2. Hot Path (Log-time): The Log() method performs ZERO map lookups, ZERO
-//     mutex locks, and ZERO heap allocations. It uses atomic.CompareAndSwap
-//     (CAS) for rate limiting and atomic.Add for sampling. String-to-byte
-//     conversion uses unsafe zero-copy (Go 1.21+). Timestamps are deferred
-//     to the worker goroutine, removing a vDSO syscall from the hot path.
+//  2. Hot Path (Log-time): The Log() method takes no loggerj-level mutex and
+//     does not allocate on the heap. Profile lookup is a linear scan for up
+//     to 8 profiles and a map lookup above that. It uses
+//     atomic.CompareAndSwap (CAS) for rate limiting and atomic.Add for
+//     sampling. The channel send that hands the entry to the worker still
+//     takes the Go runtime's internal channel lock. String-to-byte conversion
+//     uses unsafe zero-copy (Go 1.20+). Timestamps are taken by the worker
+//     when it formats the entry, not when Log is called: this removes a clock
+//     read from the hot path, but under backpressure ts reflects dequeue time.
 //  3. Worker: A dedicated goroutine formats entries, injects pre-baked
 //     []byte prefixes, and writes to the underlying io.Writer via bufio.
 //     Flush() drains the channel before writing, guaranteeing no log loss
 //     on explicit flush.
 //
-// This design ensures that logging never blocks the caller, eliminates GC
-// pressure in the hot path, and scales linearly with CPU cores without
-// lock contention.
+// This design keeps the caller's cost small and bounded: when the channel is
+// full the entry is dropped (and counted in Stats) instead of blocking the
+// caller. Throughput under heavy parallel load is limited by the shared
+// channel and the single worker goroutine.
 //
 // # Quick Start
 //
@@ -42,9 +48,12 @@
 //	)
 //
 //	ctx, cancel := context.WithCancel(context.Background())
-//	defer cancel()
 //	go logger.Start(ctx)
-//	defer logger.Close()
+//	defer func() {
+//	    logger.Flush() // drain the channel while the worker is still running
+//	    cancel()       // stop the worker
+//	    logger.Close() // close the file
+//	}()
 //
 //	// HOT PATH: Ultra-fast, zero-allocation logging
 //	logger.InfoString("HTTP", "request received", "method", "GET", "path", "/api")
@@ -71,6 +80,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -137,37 +147,46 @@ func (l Level) String() string {
 type DurabilityTier uint8
 
 const (
-	// OSBuffered (default): uses bufio.Writer with periodic flush (every
-	// 10ms or 100 logs, whichever comes first). Each write is a buffer
-	// copy (~5ns), not a syscall. Survives process crash. Does NOT survive
-	// OS crash or power loss — data may still be in the page cache.
+	// OSBuffered (default): writes go to a shared 64KB bufio.Writer. The
+	// buffer is flushed to the file when it is nearly full, or when a log
+	// call observes that at least 10ms have passed since the last flush.
+	// There is NO background timer: entries written after the last flush
+	// stay in process memory until the next log call, Flush() or Close().
 	//
-	// This is the guarantee zap and zerolog provide, though neither states
-	// it explicitly; loggerj states it here on purpose.
+	// Survives: nothing beyond the last flush. Entries still in the buffer
+	// are lost on a process crash (panic, SIGKILL, OOM). Entries already
+	// flushed to the file survive a process crash but not an OS crash or
+	// power loss (they may still be in the page cache).
 	//
-	// Throughput: ~300ns/op (competitive with zerolog/zap sync mode).
+	// Throughput: ~110ns/op on the reference machine (BENCH.md) because a
+	// write is a memory copy, not a syscall. Do not compare this number
+	// with loggers that issue one write(2) per entry; compare Direct.
 	OSBuffered DurabilityTier = iota
 
-	// Direct: one write(2) syscall per log entry, no buffering. Relies on
-	// O_APPEND atomicity for concurrent safety. Survives process crash.
-	// Does NOT survive OS crash or power loss.
+	// Direct: one write(2) syscall per log entry, no user-space buffering.
+	// Survives a process crash (data is in the OS page cache). Does NOT
+	// survive an OS crash or power loss.
 	//
-	// Throughput: ~1550ns/op (syscall overhead dominates).
+	// Throughput: ~1.5µs/op on the reference machine (syscall dominated).
 	Direct
 
-	// FsyncEveryN: calls fsync(2) after every N writes (configured via
-	// Config.FsyncEveryNCount). Survives OS crash / power loss for
-	// committed entries, at the cost of fsync latency (typically 1-10ms
-	// on spinning disk, less on SSD/NVMe).
+	// FsyncEveryN: entries go to the shared bufio.Writer; every Nth entry
+	// (Config.FsyncEveryNCount) the buffer is flushed and fsync(2) is called.
+	// Flush() and Close() also flush and fsync.
 	//
-	// Throughput: ~5000ns/op (fsync latency amortized over N logs).
+	// Survives an OS crash or power loss for entries up to the last fsync.
+	// The entries written after the last fsync (up to N-1) are still in
+	// process memory and are lost on a process crash.
+	//
+	// Throughput: see BENCH.md (BenchmarkSyncMode_FsyncEveryN).
 	FsyncEveryN
 
-	// FsyncEveryWrite: calls fsync(2) after every single write. Maximum
-	// durability, minimum throughput. Intended for audit trails, not
-	// high-volume application logs.
+	// FsyncEveryWrite: write(2) followed by fsync(2) for every entry.
+	// Survives a process crash and, if the hardware honors fsync, an OS
+	// crash or power loss. Intended for low-volume audit trails.
 	//
-	// Throughput: ~5000-10000ns/op (fsync on every log).
+	// Throughput: milliseconds per entry on the reference machine
+	// (BENCH.md); depends heavily on OS and disk.
 	FsyncEveryWrite
 )
 
@@ -234,30 +253,41 @@ type Config struct {
 	OutputFile string
 
 	// MaxFileSize is the maximum size of the log file before rotation.
-	// If 0, rotation is disabled. Default: 0
+	// If 0, rotation is disabled. Rotation is performed by the async worker
+	// only; it is NOT supported in SyncMode (the value is ignored there).
+	// Default: 0
 	MaxFileSize int64
 
-	// MaxBackupFiles is the maximum number of rotated log files to keep.
-	// Only effective if MaxFileSize > 0. Default: 0
+	// MaxBackupFiles is the number of rotated files to keep
+	// (OutputFile.1 ... OutputFile.N). 0 keeps a single backup
+	// (OutputFile.1). Only effective if MaxFileSize > 0 and not in SyncMode.
+	// Default: 0
 	MaxBackupFiles int
 
-	// SyncMode bypasses the async channel/worker pipeline and writes each log
-	// entry directly to the underlying writer with a single atomic write()
-	// syscall. When SyncMode is true:
+	// SyncMode bypasses the async channel/worker pipeline: each log call
+	// formats the entry on the caller's goroutine and writes it according to
+	// DurabilityTier. When SyncMode is true:
 	//
 	//   - The log channel and worker goroutine are NOT created.
 	//   - Start()/StartWithWriter() become no-ops.
-	//   - Flush() becomes a no-op (writes are already synchronous).
-	//   - Each log call performs: format → write() → return.
+	//   - Flush() flushes the shared buffer used by the OSBuffered and
+	//     FsyncEveryN tiers (and fsyncs for FsyncEveryN). It is a no-op for
+	//     Direct and FsyncEveryWrite, which have no user-space buffer.
+	//   - Log rotation (MaxFileSize/MaxBackupFiles) is NOT supported.
 	//
-	// The file is opened with O_APPEND, which the POSIX kernel guarantees
-	// to be atomic for writes up to PIPE_BUF (typically 4096-65536 bytes).
-	// This means concurrent goroutines writing to the same file will NOT
-	// interleave their log lines — no mutex is needed.
+	// The file is opened with O_APPEND. Concurrency per tier:
+	//
+	//   - Direct / FsyncEveryWrite: loggerj takes no mutex. Concurrent
+	//     Write calls on the same *os.File are serialized by the Go runtime,
+	//     and on Linux local file systems an O_APPEND write is applied at
+	//     the end of the file as a whole. Do not rely on that for NFS or
+	//     other network file systems.
+	//   - OSBuffered / FsyncEveryN: a mutex (syncMu) protects the shared
+	//     bufio.Writer and is held during flush and fsync.
 	//
 	// This mode is FIXED at creation time and cannot be toggled at runtime.
-	// Use for audit trails, financial logs, or any scenario requiring
-	// per-log write guarantees. Target: <400ns/op, ≤1 alloc/op.
+	// Use it when you need a documented durability tier; see DurabilityTier
+	// for what each tier survives.
 	//
 	// Default: false (async mode)
 	SyncMode bool
@@ -329,18 +359,16 @@ type SubOption func(*SubProfile)
 
 // WithSampleRate enables statistical sampling for this logType.
 //
-// Only 1 out of every `rate` logs will be emitted. For example, WithSampleRate(10)
-// means approximately 10% of logs pass through. Useful for high-volume debug
-// traces where statistical representation is sufficient.
+// Only 1 out of every `rate` entries that reach the sampler is emitted. For
+// example, WithSampleRate(10) emits roughly 10% of them (the 10th, 20th, ...
+// call; the first nine are dropped). Useful for high-volume debug traces
+// where statistical representation is sufficient.
 //
-// GATE ORDER: Sampling is applied BEFORE rate limiting.
-// This is a performance optimization: sampling uses atomic.Add (~1ns),
-// while rate limiting uses time.Now() (~34ns) + CAS (~2.5ns).
-// By sampling first, we avoid the expensive syscall on the majority of logs
-// that would be discarded anyway.
-//
-// If you need rate limiting on the raw input stream (not the sampled subset),
-// do not combine sampling with rate limiting. Use rate limiting alone.
+// GATE ORDER (v1.4.x): when a profile also has WithRateLimit, the rate
+// limiter runs BEFORE the sampler. The sampler therefore only sees the
+// entries the rate limiter admitted, so the sampling ratio applies to the
+// rate-limited stream, not to the raw input. See WithRateLimit for a worked
+// example. v1.5.0 is planned to switch to sampling first (see ROADMAP.md).
 //
 // The sampling counter is atomic and lock-free, supporting concurrent logging.
 func WithSampleRate(rate int64) SubOption {
@@ -497,15 +525,19 @@ func (e *Entry) Reset() {
 		e.Msg = e.Msg[:0]
 	}
 
+	// clear() drops the string references held by the pooled backing arrays
+	// so that a large field value is not kept alive until the Entry is reused.
 	if cap(e.Fields) > 64 {
 		e.Fields = nil
 	} else {
+		clear(e.Fields)
 		e.Fields = e.Fields[:0]
 	}
 
 	if cap(e.FieldsV) > 64 {
 		e.FieldsV = nil
 	} else {
+		clear(e.FieldsV)
 		e.FieldsV = e.FieldsV[:0]
 	}
 }
@@ -637,12 +669,19 @@ func NewLogger(c Config) *Logger {
 	if l.cfg.RateLimitWindow < 1 {
 		l.cfg.RateLimitWindow = 1
 	}
+	if l.cfg.FsyncEveryNCount <= 0 {
+		l.cfg.FsyncEveryNCount = 100 // documented default
+	}
 
-	l.logCh = make(chan *Entry, l.cfg.ChannelSize)
+	// Sync mode has no worker, so it needs neither the channel nor the
+	// buffered file handle opened by openLogFile (it opens its own handle).
+	if !l.cfg.SyncMode {
+		l.logCh = make(chan *Entry, l.cfg.ChannelSize)
+	}
 	l.currentLevel.Store(uint32(LevelInfo))
 	l.defaultProfile = &SubProfile{Name: "DEFAULT"}
 
-	if l.cfg.OutputFile != "" {
+	if l.cfg.OutputFile != "" && !l.cfg.SyncMode {
 		l.outputFilePath = l.cfg.OutputFile
 		if err := l.openLogFile(); err != nil {
 			fmt.Fprintf(os.Stderr, "loggerj: failed to open log file: %v\n", err)
@@ -973,6 +1012,9 @@ const (
 // If ctx is nil or contains no known keys, it behaves exactly like
 // InfoString with zero additional cost.
 func (l *Logger) InfoCtx(ctx context.Context, logType string, msg string, fields ...string) {
+	if LevelInfo < Level(l.currentLevel.Load()) {
+		return // filtered: skip the context lookups
+	}
 	fields = appendCtxFields(ctx, fields)
 	l.log(LevelInfo, logType, unsafeStringToBytes(msg), 2, fields...)
 }
@@ -981,6 +1023,9 @@ func (l *Logger) InfoCtx(ctx context.Context, logType string, msg string, fields
 // If ctx is nil or contains no known keys, it behaves exactly like
 // DebugString with zero additional cost.
 func (l *Logger) DebugCtx(ctx context.Context, logType string, msg string, fields ...string) {
+	if LevelDebug < Level(l.currentLevel.Load()) {
+		return // filtered: skip the context lookups
+	}
 	fields = appendCtxFields(ctx, fields)
 	l.log(LevelDebug, logType, unsafeStringToBytes(msg), 2, fields...)
 }
@@ -989,6 +1034,9 @@ func (l *Logger) DebugCtx(ctx context.Context, logType string, msg string, field
 // If ctx is nil or contains no known keys, it behaves exactly like
 // WarnString with zero additional cost.
 func (l *Logger) WarnCtx(ctx context.Context, logType string, msg string, fields ...string) {
+	if LevelWarn < Level(l.currentLevel.Load()) {
+		return // filtered: skip the context lookups
+	}
 	fields = appendCtxFields(ctx, fields)
 	l.log(LevelWarn, logType, unsafeStringToBytes(msg), 2, fields...)
 }
@@ -997,6 +1045,9 @@ func (l *Logger) WarnCtx(ctx context.Context, logType string, msg string, fields
 // If ctx is nil or contains no known keys, it behaves exactly like
 // ErrorString with zero additional cost.
 func (l *Logger) ErrorCtx(ctx context.Context, logType string, msg string, fields ...string) {
+	if LevelError < Level(l.currentLevel.Load()) {
+		return // filtered: skip the context lookups
+	}
 	fields = appendCtxFields(ctx, fields)
 	l.log(LevelError, logType, unsafeStringToBytes(msg), 2, fields...)
 }
@@ -1009,49 +1060,49 @@ func (l *Logger) ErrorCtx(ctx context.Context, logType string, msg string, field
 // This is the zero-allocation alternative to Log() with string fields.
 // Caller skip is 1.
 func (l *Logger) LogFields(level Level, logType string, msg []byte, fields ...Field) {
-	l.logTyped(level, logType, msg, 1, fields...)
+	l.logTyped(level, logType, msg, 1, 0, fields...)
 }
 
 // DebugFields logs a message at LevelDebug with typed fields. Caller skip is 2.
 func (l *Logger) DebugFields(logType string, msg []byte, fields ...Field) {
-	l.logTyped(LevelDebug, logType, msg, 2, fields...)
+	l.logTyped(LevelDebug, logType, msg, 2, 0, fields...)
 }
 
 // InfoFields logs a message at LevelInfo with typed fields. Caller skip is 2.
 func (l *Logger) InfoFields(logType string, msg []byte, fields ...Field) {
-	l.logTyped(LevelInfo, logType, msg, 2, fields...)
+	l.logTyped(LevelInfo, logType, msg, 2, 0, fields...)
 }
 
 // WarnFields logs a message at LevelWarn with typed fields. Caller skip is 2.
 func (l *Logger) WarnFields(logType string, msg []byte, fields ...Field) {
-	l.logTyped(LevelWarn, logType, msg, 2, fields...)
+	l.logTyped(LevelWarn, logType, msg, 2, 0, fields...)
 }
 
 // ErrorFields logs a message at LevelError with typed fields. Caller skip is 2.
 func (l *Logger) ErrorFields(logType string, msg []byte, fields ...Field) {
-	l.logTyped(LevelError, logType, msg, 2, fields...)
+	l.logTyped(LevelError, logType, msg, 2, 0, fields...)
 }
 
 // --- String variants (zero-copy message conversion) ---
 
 // DebugFieldsString logs a string message at LevelDebug with typed fields.
 func (l *Logger) DebugFieldsString(logType string, msg string, fields ...Field) {
-	l.logTyped(LevelDebug, logType, unsafeStringToBytes(msg), 2, fields...)
+	l.logTyped(LevelDebug, logType, unsafeStringToBytes(msg), 2, 0, fields...)
 }
 
 // InfoFieldsString logs a string message at LevelInfo with typed fields.
 func (l *Logger) InfoFieldsString(logType string, msg string, fields ...Field) {
-	l.logTyped(LevelInfo, logType, unsafeStringToBytes(msg), 2, fields...)
+	l.logTyped(LevelInfo, logType, unsafeStringToBytes(msg), 2, 0, fields...)
 }
 
 // WarnFieldsString logs a string message at LevelWarn with typed fields.
 func (l *Logger) WarnFieldsString(logType string, msg string, fields ...Field) {
-	l.logTyped(LevelWarn, logType, unsafeStringToBytes(msg), 2, fields...)
+	l.logTyped(LevelWarn, logType, unsafeStringToBytes(msg), 2, 0, fields...)
 }
 
 // ErrorFieldsString logs a string message at LevelError with typed fields.
 func (l *Logger) ErrorFieldsString(logType string, msg string, fields ...Field) {
-	l.logTyped(LevelError, logType, unsafeStringToBytes(msg), 2, fields...)
+	l.logTyped(LevelError, logType, unsafeStringToBytes(msg), 2, 0, fields...)
 }
 
 // appendCtxFields extracts known keys (TraceIDKey, RequestIDKey, SpanIDKey)
@@ -1081,17 +1132,16 @@ func appendCtxFields(ctx context.Context, fields []string) []string {
 // the level check has already been performed by the caller (the level check
 // is inlined into log()/logTyped() for the ~2ns filtered fast-path).
 //
-// Order of operations (intentional, fixed, documented trade-off):
-//  1. Rate Limit (admission control): Rejects logs that exceed the quota.
-//     Running this FIRST leverages the ~0.3ns fast-path rejection when
-//     saturated, saving the CPU cost of the sampling atomic.Add.
-//  2. Sampling (cost reduction): From the admitted logs, selects 1-out-of-N
-//     to write. This means the sampling ratio applies to the *rate-limited*
-//     stream, not the raw input stream.
+// Order of operations (v1.4.x; documented in WithRateLimit/WithSampleRate):
+//  1. Rate limit (admission control): rejects entries over the quota. It
+//     costs one clock read (~34ns) on every call, including calls that
+//     sampling would have discarded.
+//  2. Sampling: selects 1-out-of-N of the ADMITTED entries.
 //
-// If you need sampling to run before rate limiting (rare), implement it at
-// the call site. This order is fixed to keep the hot path branch-free and
-// to protect the sampling counter from raw input floods.
+// The sampling ratio therefore applies to the rate-limited stream, not to
+// the raw input. v1.5.0 is planned to run sampling first (cheaper, and the
+// rate limit then caps the output). That is a behavior change and is not
+// done in a patch release.
 //
 //go:nosplit
 func (l *Logger) checkGatesAfterLevel(logType string) (*SubProfile, bool) {
@@ -1099,9 +1149,8 @@ func (l *Logger) checkGatesAfterLevel(logType string) (*SubProfile, bool) {
 	p := l.getProfile(logType)
 
 	// 2. Lock-free rate limiting (atomic CAS)
-	// MUST run before sampling: admission control protects the sampling
-	// counter and the downstream channel from raw input floods.
-	// Under saturation, this returns false in ~0.3ns without executing CAS.
+	// Runs before sampling in v1.4.x. Under saturation the CAS is skipped,
+	// but the clock read performed by checkAtomicRateLimit is still paid.
 	if p.rlLimit > 0 {
 		if !l.checkAtomicRateLimit(p) {
 			return nil, false
@@ -1109,7 +1158,7 @@ func (l *Logger) checkGatesAfterLevel(logType string) (*SubProfile, bool) {
 	}
 
 	// 3. Lock-free sampling (atomic.Add)
-	// Applies to the admitted (rate-limited) stream.
+	// Applies to the entries admitted by the rate limiter.
 	if p.sampleRate > 0 {
 		if p.sampleCount.Add(1)%p.sampleRate != 0 {
 			return nil, false
@@ -1135,6 +1184,23 @@ func (l *Logger) captureCaller(skip int) (file string, line int) {
 		}
 	}
 	return file, line
+}
+
+// callerFromPC resolves file:line from a program counter recorded by the
+// caller (for example slog.Record.PC). It returns empty values when
+// IncludeCaller is disabled.
+func (l *Logger) callerFromPC(pc uintptr) (file string, line int) {
+	if !l.cfg.IncludeCaller || pc == 0 {
+		return "", 0
+	}
+	frame, _ := runtime.CallersFrames([]uintptr{pc}).Next()
+	file = frame.File
+	for i := len(file) - 1; i > 0; i-- {
+		if file[i] == '/' {
+			return file[i+1:], frame.Line
+		}
+	}
+	return file, frame.Line
 }
 
 // dispatch sends a populated Entry to the worker via the non-blocking
@@ -1197,11 +1263,13 @@ func (l *Logger) log(level Level, logType string, msg []byte, skip int, fields .
 }
 
 // logTyped is the internal core logging method for the typed Field API.
+// If pc is non-zero (slog.Record.PC) it is used to resolve the caller and
+// skip is ignored; otherwise the caller is resolved with skip.
 // Identical gating and dispatch to log(), but populates Entry.FieldsV
 // instead of Entry.Fields — Field values are copied by value (no
 // interface{} boxing), so this path is zero-allocation even when the
 // caller logs integers, booleans, floats, durations, or errors.
-func (l *Logger) logTyped(level Level, logType string, msg []byte, skip int, fields ...Field) {
+func (l *Logger) logTyped(level Level, logType string, msg []byte, skip int, pc uintptr, fields ...Field) {
 	// Fast-path: level filter (~2ns, zero alloc) — INLINED for hot path.
 	if level < Level(l.currentLevel.Load()) {
 		return
@@ -1212,14 +1280,21 @@ func (l *Logger) logTyped(level Level, logType string, msg []byte, skip int, fie
 		return
 	}
 
+	// Resolve the caller once. A non-zero pc (slog.Record.PC) is exact and
+	// independent of call depth; otherwise fall back to the skip count.
+	var file string
+	var line int
+	if pc != 0 {
+		file, line = l.callerFromPC(pc)
+	} else {
+		file, line = l.captureCaller(skip)
+	}
+
 	// Sync mode: bypass channel/worker, write directly.
 	if l.cfg.SyncMode {
-		file, line := l.captureCaller(skip)
 		l.syncWrite(level, logType, msg, p, fields, nil, file, line)
 		return
 	}
-
-	file, line := l.captureCaller(skip)
 
 	e := l.pool.Get().(*Entry)
 	e.Level = level
@@ -1236,19 +1311,23 @@ func (l *Logger) logTyped(level Level, logType string, msg []byte, skip int, fie
 // syncWrite formats and writes a log entry synchronously using a pooled
 // buffer. The write strategy depends on Config.DurabilityTier:
 //
-//   - OSBuffered: buffer copy to bufio.Writer, periodic flush (~10ms).
-//     Throughput: ~111ns/op single-thread, ~238ns/op parallel.
-//   - Direct: single write() syscall, O_APPEND atomic. Throughput: ~1566ns/op.
-//   - FsyncEveryN: write() + fsync() every N logs. Throughput: ~5000ns/op.
-//   - FsyncEveryWrite: write() + fsync() on every log. Throughput: ~4.4ms/op.
+//   - OSBuffered: buffer copy to bufio.Writer; flushed when the buffer is
+//     nearly full or when a later call sees >=10ms since the last flush
+//     (no background timer). Throughput: ~111ns/op single-thread,
+//     ~238ns/op parallel on the reference machine (no syscall per entry).
+//   - Direct: single write() syscall per entry. Throughput: ~1566ns/op.
+//   - FsyncEveryN: bufio buffer, flush + fsync() every N entries.
+//   - FsyncEveryWrite: write() + fsync() on every entry (~4.4ms/op on the
+//     reference machine).
 //
-// Lock-free status per tier (HONEST DISCLOSURE):
-//   - Direct / FsyncEveryWrite: TRUE lock-free write path (O_APPEND atomic).
-//   - OSBuffered / FsyncEveryN: NOT lock-free. syncMu is held during BOTH
-//     the buffer copy AND the flush/fsync syscall because bufio.Writer is
-//     not thread-safe. This is the root cause of the ~2x parallel slowdown
-//     (111ns → 238ns). We accept this contention because a per-goroutine
-//     writer pool would lose buffered data on Close().
+// Locking per tier:
+//   - Direct / FsyncEveryWrite: no loggerj mutex. os.File.Write still
+//     serializes concurrent writers on the same file internally.
+//   - OSBuffered / FsyncEveryN: syncMu is held during BOTH the buffer copy
+//     AND the flush/fsync syscall because bufio.Writer is not thread-safe.
+//     This is the root cause of the ~2x parallel slowdown (111ns -> 238ns).
+//     A per-goroutine writer pool would avoid it but would lose buffered
+//     data on Close().
 func (l *Logger) syncWrite(level Level, logType string, msg []byte, p *SubProfile, fields []Field, stringFields []string, file string, line int) {
 	bp := l.syncBufPool.Get().(*[]byte)
 	buf := (*bp)[:0]
@@ -1273,7 +1352,9 @@ func (l *Logger) syncWrite(level Level, logType string, msg []byte, p *SubProfil
 	case OSBuffered:
 		l.syncMu.Lock()
 		if l.syncBw != nil {
-			l.syncBw.Write(buf)
+			if _, err := l.syncBw.Write(buf); err != nil {
+				l.noteSyncError("write", err)
+			}
 			// Flush trigger 1: buffer nearly full
 			// Flush trigger 2: 10ms elapsed since last flush
 			shouldFlush := l.syncBw.Available() < len(buf)
@@ -1284,7 +1365,9 @@ func (l *Logger) syncWrite(level Level, logType string, msg []byte, p *SubProfil
 				}
 			}
 			if shouldFlush {
-				l.syncBw.Flush()
+				if err := l.syncBw.Flush(); err != nil {
+					l.noteSyncError("flush", err)
+				}
 				l.syncLastFlushMs.Store(time.Now().UnixMilli())
 			}
 		} else {
@@ -1298,14 +1381,18 @@ func (l *Logger) syncWrite(level Level, logType string, msg []byte, p *SubProfil
 	case FsyncEveryN:
 		l.syncMu.Lock()
 		if l.syncBw != nil {
-			l.syncBw.Write(buf)
+			if _, err := l.syncBw.Write(buf); err != nil {
+				l.noteSyncError("write", err)
+			}
 		} else {
 			l.syncFileWrite(buf)
 		}
 		count := l.syncWriteCount.Add(1)
 		if count >= int64(l.cfg.FsyncEveryNCount) {
 			if l.syncBw != nil {
-				l.syncBw.Flush()
+				if err := l.syncBw.Flush(); err != nil {
+					l.noteSyncError("flush", err)
+				}
 			}
 			l.syncFileSync()
 			l.syncWriteCount.Store(0)
@@ -1331,9 +1418,7 @@ func (l *Logger) syncWrite(level Level, logType string, msg []byte, p *SubProfil
 // the counter is the observable signal.
 func (l *Logger) syncFileWrite(buf []byte) {
 	if _, err := l.syncFile.Write(buf); err != nil {
-		l.syncWriteErrors.Add(1)
-		fmt.Fprintf(os.Stderr, "loggerj: sync write error (tier=%s): %v\n",
-			l.cfg.DurabilityTier, err)
+		l.noteSyncError("write", err)
 	}
 }
 
@@ -1341,9 +1426,34 @@ func (l *Logger) syncFileWrite(buf []byte) {
 // are rare but indicate serious durability problems.
 func (l *Logger) syncFileSync() {
 	if err := l.syncFile.Sync(); err != nil {
-		l.syncWriteErrors.Add(1)
-		fmt.Fprintf(os.Stderr, "loggerj: sync fsync error (tier=%s): %v\n",
-			l.cfg.DurabilityTier, err)
+		l.noteSyncError("fsync", err)
+	}
+}
+
+// noteSyncError counts a failed sync-mode I/O operation and reports it to
+// stderr. op is one of "write", "flush" or "fsync". The counter is exposed
+// as Stats().SyncWriteErrors.
+func (l *Logger) noteSyncError(op string, err error) {
+	l.syncWriteErrors.Add(1)
+	fmt.Fprintf(os.Stderr, "loggerj: sync %s error (tier=%s): %v\n",
+		op, l.cfg.DurabilityTier, err)
+}
+
+// syncFlush flushes the shared bufio.Writer used by the OSBuffered and
+// FsyncEveryN tiers and, for FsyncEveryN, fsyncs the file. It is a no-op for
+// Direct and FsyncEveryWrite, which have no user-space buffer.
+func (l *Logger) syncFlush() {
+	if l.syncBw == nil {
+		return
+	}
+	l.syncMu.Lock()
+	defer l.syncMu.Unlock()
+	if err := l.syncBw.Flush(); err != nil {
+		l.noteSyncError("flush", err)
+	}
+	if l.cfg.DurabilityTier == FsyncEveryN && l.syncFile != nil && l.syncFile != os.Stderr {
+		l.syncFileSync()
+		l.syncWriteCount.Store(0)
 	}
 }
 
@@ -1433,16 +1543,9 @@ workerLoop:
 			if len(buf) >= flushThreshold {
 				l.writeOut(bw, buf)
 				buf = buf[:0]
-				if l.cfg.OutputFile != "" {
-					if rotated, err := l.rotateLogFile(); err != nil {
-						fmt.Fprintf(os.Stderr, "loggerj: rotation error: %v\n", err)
-					} else if rotated {
-						// CRITICAL: Refresh the writer handle after rotation.
-						// The old bw points to a closed file; l.currentWriter
-						// is the fresh handle opened by rotateLogFile.
-						bw = l.currentWriter
-					}
-				}
+				// rotateIfNeeded returns the writer to use from now on:
+				// after a rotation the old bw points to a closed file.
+				bw = l.rotateIfNeeded(bw)
 			}
 
 		// ── Periodic flush ──
@@ -1450,14 +1553,8 @@ workerLoop:
 			if len(buf) > 0 {
 				l.writeOut(bw, buf)
 				buf = buf[:0]
-				// Optional: check rotation on ticker as well (safety net)
-				if l.cfg.OutputFile != "" {
-					if rotated, err := l.rotateLogFile(); err != nil {
-						fmt.Fprintf(os.Stderr, "loggerj: rotation error: %v\n", err)
-					} else if rotated {
-						bw = l.currentWriter
-					}
-				}
+				// Check rotation on the ticker as well (safety net).
+				bw = l.rotateIfNeeded(bw)
 			}
 
 		// ── Explicit Flush() call ──
@@ -1646,59 +1743,30 @@ func appendFieldsJSON(buf []byte, fields []string) []byte {
 
 // appendJSONString appends a JSON-escaped string (with surrounding quotes)
 // to buf. Control characters (< 0x20), DEL (0x7F), double quotes, and
-// backslashes are escaped per RFC 8259.
+// backslashes are escaped per RFC 8259. Invalid UTF-8 bytes are replaced by
+// the escape \ufffd (one per invalid byte, like encoding/json), so the output
+// is always valid JSON.
 func appendJSONString(buf []byte, s string) []byte {
-	buf = append(buf, '"')
-
-	start := 0
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-
-		if c < 0x20 || c == 0x7F || c == '"' || c == '\\' {
-			if start < i {
-				buf = append(buf, s[start:i]...)
-			}
-
-			buf = append(buf, '\\')
-
-			switch c {
-			case '"', '\\':
-				buf = append(buf, c)
-			case '\n':
-				buf = append(buf, 'n')
-			case '\r':
-				buf = append(buf, 'r')
-			case '\t':
-				buf = append(buf, 't')
-			default:
-				buf = append(buf, 'u', '0', '0',
-					"0123456789abcdef"[c>>4],
-					"0123456789abcdef"[c&0xf],
-				)
-			}
-
-			start = i + 1
-		}
-	}
-
-	if start < len(s) {
-		buf = append(buf, s[start:]...)
-	}
-
-	buf = append(buf, '"')
-	return buf
+	// The conversion is zero-copy and read-only; appendJSONStringBytes never
+	// retains or mutates its input.
+	return appendJSONStringBytes(buf, unsafeStringToBytes(s))
 }
 
-// appendJSONStringBytes appends a JSON-escaped byte slice (with surrounding
-// quotes) to buf. Identical escaping rules as appendJSONString.
+// appendJSONStringBytes is the byte-slice form of appendJSONString and holds
+// the single implementation of the escaping rules.
 func appendJSONStringBytes(buf []byte, s []byte) []byte {
 	buf = append(buf, '"')
 
 	start := 0
-	for i := 0; i < len(s); i++ {
+	for i := 0; i < len(s); {
 		c := s[i]
 
-		if c < 0x20 || c == 0x7F || c == '"' || c == '\\' {
+		if c < utf8.RuneSelf {
+			if c >= 0x20 && c != 0x7F && c != '"' && c != '\\' {
+				i++
+				continue
+			}
+
 			if start < i {
 				buf = append(buf, s[start:i]...)
 			}
@@ -1721,8 +1789,23 @@ func appendJSONStringBytes(buf []byte, s []byte) []byte {
 				)
 			}
 
-			start = i + 1
+			i++
+			start = i
+			continue
 		}
+
+		// Multi-byte sequence: keep valid UTF-8 as is, replace invalid bytes.
+		r, size := utf8.DecodeRune(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			if start < i {
+				buf = append(buf, s[start:i]...)
+			}
+			buf = append(buf, `\ufffd`...)
+			i += size
+			start = i
+			continue
+		}
+		i += size
 	}
 
 	if start < len(s) {
@@ -1768,7 +1851,19 @@ func appendFieldValueJSON(buf []byte, f *Field) []byte {
 	case Uint64Type:
 		buf = strconv.AppendUint(buf, f.Num, 10)
 	case Float64Type:
-		buf = strconv.AppendFloat(buf, float64FromBits(f.Num), 'g', -1, 64)
+		// JSON has no NaN/Inf literals; emit them as strings (same as zap
+		// and zerolog) so the line stays valid JSON.
+		fv := float64FromBits(f.Num)
+		switch {
+		case math.IsNaN(fv):
+			buf = append(buf, `"NaN"`...)
+		case math.IsInf(fv, 1):
+			buf = append(buf, `"+Inf"`...)
+		case math.IsInf(fv, -1):
+			buf = append(buf, `"-Inf"`...)
+		default:
+			buf = strconv.AppendFloat(buf, fv, 'g', -1, 64)
+		}
 	case BoolType:
 		if f.Num == 1 {
 			buf = append(buf, "true"...)
@@ -1776,7 +1871,7 @@ func appendFieldValueJSON(buf []byte, f *Field) []byte {
 			buf = append(buf, "false"...)
 		}
 	case DurationType:
-		// Render as string for readability: "150.5ms", "2.3s"
+		// Render as string for readability: "150ms", "2.005s"
 		buf = append(buf, '"')
 		buf = appendDuration(buf, time.Duration(f.Num))
 		buf = append(buf, '"')
@@ -1790,14 +1885,16 @@ func appendFieldValueJSON(buf []byte, f *Field) []byte {
 
 // appendTypedFieldsText appends typed fields in text format: key=val key2=val2
 func appendTypedFieldsText(buf []byte, fields []Field) []byte {
+	first := true
 	for i := range fields {
 		f := &fields[i]
 		if f.Key == "" && f.Type == StringType && f.Str == "" {
 			continue // zero-value Field — skip
 		}
-		if i > 0 {
+		if !first {
 			buf = append(buf, ' ')
 		}
+		first = false
 		buf = append(buf, f.Key...)
 		buf = append(buf, '=')
 		buf = appendFieldValueText(buf, f)
@@ -1833,42 +1930,63 @@ func appendFieldValueText(buf []byte, f *Field) []byte {
 }
 
 // appendDuration formats a duration in human-readable form without
-// allocation (Go's time.Duration.String() allocates).
+// allocation (Go's time.Duration.String() allocates). Output is parseable by
+// time.ParseDuration. Precision: nanoseconds below 1µs, microseconds below
+// 1ms, milliseconds below 1 minute, whole seconds from 1 minute up; the
+// remainder is truncated, never rounded. Examples: "150ms", "2.005s",
+// "2m30s", "1h30m", "-1.500s".
 func appendDuration(buf []byte, d time.Duration) []byte {
-	if d == 0 {
+	if d < 0 {
+		buf = append(buf, '-')
+		// Negate through uint64 so that math.MinInt64 does not overflow.
+		return appendDurationAbs(buf, uint64(-(d+1))+1)
+	}
+	return appendDurationAbs(buf, uint64(d))
+}
+
+// appendDurationAbs formats a non-negative duration given in nanoseconds.
+func appendDurationAbs(buf []byte, ns uint64) []byte {
+	switch {
+	case ns == 0:
 		return append(buf, "0s"...)
-	}
-	if d < time.Microsecond {
-		buf = strconv.AppendInt(buf, d.Nanoseconds(), 10)
+	case ns < uint64(time.Microsecond):
+		buf = strconv.AppendUint(buf, ns, 10)
 		return append(buf, "ns"...)
-	}
-	if d < time.Millisecond {
-		buf = strconv.AppendInt(buf, d.Microseconds(), 10)
-		return append(buf, "µs"...)
-	}
-	if d < time.Second {
-		buf = strconv.AppendInt(buf, d.Milliseconds(), 10)
+	case ns < uint64(time.Millisecond):
+		buf = strconv.AppendUint(buf, ns/uint64(time.Microsecond), 10)
+		return append(buf, "\u00b5s"...)
+	case ns < uint64(time.Second):
+		buf = strconv.AppendUint(buf, ns/uint64(time.Millisecond), 10)
 		return append(buf, "ms"...)
-	}
-	if d < time.Minute {
-		// e.g., "2.5s" — use integer seconds + fractional ms
-		sec := d / time.Second
-		ms := (d - sec*time.Second) / time.Millisecond
-		buf = strconv.AppendInt(buf, int64(sec), 10)
+	case ns < uint64(time.Minute):
+		sec := ns / uint64(time.Second)
+		ms := (ns % uint64(time.Second)) / uint64(time.Millisecond)
+		buf = strconv.AppendUint(buf, sec, 10)
 		if ms > 0 {
-			buf = append(buf, '.')
-			buf = strconv.AppendInt(buf, int64(ms), 10)
+			// Zero-padded to 3 digits: 2005ms is "2.005s", not "2.5s".
+			buf = append(buf, '.',
+				byte('0'+ms/100),
+				byte('0'+(ms/10)%10),
+				byte('0'+ms%10),
+			)
 		}
 		return append(buf, 's')
 	}
-	// Fallback for >= 1 minute: "2m30s"
-	min := d / time.Minute
-	d -= min * time.Minute
-	sec := d / time.Second
-	buf = strconv.AppendInt(buf, int64(min), 10)
-	buf = append(buf, 'm')
-	if sec > 0 {
-		buf = strconv.AppendInt(buf, int64(sec), 10)
+
+	// >= 1 minute: "2m30s", "1h30m", "100h". Zero components are omitted.
+	hours := ns / uint64(time.Hour)
+	mins := (ns % uint64(time.Hour)) / uint64(time.Minute)
+	secs := (ns % uint64(time.Minute)) / uint64(time.Second)
+	if hours > 0 {
+		buf = strconv.AppendUint(buf, hours, 10)
+		buf = append(buf, 'h')
+	}
+	if mins > 0 {
+		buf = strconv.AppendUint(buf, mins, 10)
+		buf = append(buf, 'm')
+	}
+	if secs > 0 {
+		buf = strconv.AppendUint(buf, secs, 10)
 		buf = append(buf, 's')
 	}
 	return buf
@@ -1917,19 +2035,69 @@ func (l *Logger) openLogFile() error {
 	return nil
 }
 
-// rotateLogFile performs size-based log rotation. Returns (true, nil) if
-// rotation occurred, (false, nil) if no rotation needed, or (false, err)
-// on failure. The caller must refresh its bufio.Writer handle after a
-// successful rotation to avoid writing to a closed file.
+// rotateIfNeeded rotates the log file when it exceeds MaxFileSize and returns
+// the bufio.Writer the worker must use afterwards. Errors are reported to
+// stderr and counted in Stats().RotationErrors.
+func (l *Logger) rotateIfNeeded(bw *bufio.Writer) *bufio.Writer {
+	if l.cfg.OutputFile == "" {
+		return bw
+	}
+	rotated, err := l.rotateLogFile()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "loggerj: rotation error: %v\n", err)
+	}
+	if rotated {
+		return l.currentWriter
+	}
+	return bw
+}
+
+// reopenAppendLocked reopens the log file in append mode WITHOUT truncating
+// it. Callers must hold rotationMu.
+func (l *Logger) reopenAppendLocked() error {
+	f, err := os.OpenFile(l.outputFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return err
+	}
+	stat, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return err
+	}
+
+	l.currentFile = f
+	l.currentWriter = bufio.NewWriterSize(f, l.cfg.WriterBufferSize)
+	l.currentSize = stat.Size()
+
+	l.globalWriterMu.Lock()
+	l.globalWriter = l.currentWriter
+	l.globalWriterMu.Unlock()
+	return nil
+}
+
+// rotateLogFile performs size-based log rotation. It returns (true, nil) if
+// rotation occurred, (false, nil) if no rotation was needed. It returns
+// rotated=true together with a non-nil error when rotation was skipped but the
+// log file was reopened (the caller must refresh its bufio.Writer in every
+// rotated=true case). It returns (false, err) on failures after which no
+// usable writer exists.
+//
+// Steps: (1) move the live log to OutputFile.rotating; if this fails nothing
+// else is touched and the live log keeps being appended to (it is never
+// truncated); (2) shift backups .N-1 -> .N ... .1 -> .2; (3) move
+// OutputFile.rotating to OutputFile.1; (4) create a fresh log file.
+// MaxBackupFiles=N keeps N backups (.1 ... .N); 0 keeps a single backup (.1).
 //
 // HONEST SCOPE DISCLOSURE:
 //   - Size-based rotation ONLY. No time-based (daily/hourly) rotation.
 //   - No compression (gzip). Backup files are plain text copies.
+//   - Async mode only; SyncMode does not rotate.
 //   - This is a SUBSET of lumberjack's functionality, traded for zero
 //     external dependencies.
 //   - Rotation failures are counted in Stats().RotationErrors and logged
 //     to stderr. A persistent permission error (e.g., read-only disk)
-//     will silently break the rotation chain — monitor RotationErrors.
+//     keeps the log growing without rotation and reports an error on every
+//     flush attempt; monitor RotationErrors.
 //   - For production systems requiring daily rotation, compression, or
 //     remote shipping, use lumberjack or a dedicated log shipper as the
 //     underlying io.Writer via StartWithWriter().
@@ -1954,7 +2122,20 @@ func (l *Logger) rotateLogFile() (rotated bool, err error) {
 		}
 	}
 
-	// Shift existing backups: .4 → .5, .3 → .4, .2 → .3, .1 → .2
+	// Step 1: move the live log aside. If this fails, keep appending to the
+	// existing file instead of truncating it (which would destroy the log).
+	rotating := l.outputFilePath + ".rotating"
+	if err := os.Rename(l.outputFilePath, rotating); err != nil {
+		l.rotationErrors.Add(1)
+		if rerr := l.reopenAppendLocked(); rerr != nil {
+			return false, fmt.Errorf("rename current log failed (%v) and reopen failed: %w", err, rerr)
+		}
+		return true, fmt.Errorf("rename current log: %w (rotation skipped, still appending to the existing file)", err)
+	}
+
+	// Step 2: shift existing backups: .4 -> .5, .3 -> .4, .2 -> .3, .1 -> .2.
+	// os.Rename replaces the destination, so the oldest backup (.N) is
+	// overwritten by .N-1 and needs no separate removal.
 	for i := l.cfg.MaxBackupFiles - 1; i > 0; i-- {
 		src := fmt.Sprintf("%s.%d", l.outputFilePath, i)
 		dst := fmt.Sprintf("%s.%d", l.outputFilePath, i+1)
@@ -1964,22 +2145,13 @@ func (l *Logger) rotateLogFile() (rotated bool, err error) {
 		}
 	}
 
-	// Rename current log to .1
-	if err := os.Rename(l.outputFilePath, l.outputFilePath+".1"); err != nil {
+	// Step 3: the rotated log becomes backup .1.
+	if err := os.Rename(rotating, l.outputFilePath+".1"); err != nil {
 		l.rotationErrors.Add(1)
-		fmt.Fprintf(os.Stderr, "loggerj: failed to rename current log: %v\n", err)
+		fmt.Fprintf(os.Stderr, "loggerj: failed to move %s to backup .1 (left in place): %v\n", rotating, err)
 	}
 
-	// Remove the oldest backup if it exceeds MaxBackupFiles
-	if l.cfg.MaxBackupFiles > 0 {
-		oldest := fmt.Sprintf("%s.%d", l.outputFilePath, l.cfg.MaxBackupFiles)
-		if err := os.Remove(oldest); err != nil && !os.IsNotExist(err) {
-			l.rotationErrors.Add(1)
-			fmt.Fprintf(os.Stderr, "loggerj: failed to remove oldest backup: %v\n", err)
-		}
-	}
-
-	// Create a fresh log file
+	// Step 4: create a fresh log file.
 	f, err := os.OpenFile(l.outputFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		return false, fmt.Errorf("failed to open new log file: %w", err)
@@ -1998,7 +2170,6 @@ func (l *Logger) rotateLogFile() (rotated bool, err error) {
 	l.globalWriter = l.currentWriter
 	l.globalWriterMu.Unlock()
 
-	// At the end, before returning:
 	return true, nil
 }
 
@@ -2032,9 +2203,20 @@ func (l *Logger) drainAndFlush(bw *bufio.Writer, buf []byte) {
 // If no worker is running, Flush drains and discards all pending entries
 // to prevent channel blockage. This also fixes the 1-second block that
 // occurred when OutputFile was set but Start() hadn't been called yet.
+// The discarded entries are not counted in Drops(). Note that
+// `go logger.Start(ctx)` returns before the worker goroutine has run, so a
+// Flush() issued immediately afterwards can still observe "no worker" and
+// discard entries; the public API offers no way to wait for worker start in
+// v1.4.x.
+//
+// In SyncMode, Flush flushes the shared buffer of the OSBuffered and
+// FsyncEveryN tiers (and fsyncs for FsyncEveryN); it does nothing for Direct
+// and FsyncEveryWrite.
 func (l *Logger) Flush() {
-	// Sync mode: writes are already synchronous. Nothing to flush.
+	// Sync mode: flush the shared buffer of the buffered tiers (no-op for
+	// Direct and FsyncEveryWrite).
 	if l.cfg.SyncMode {
+		l.syncFlush()
 		return
 	}
 
@@ -2074,17 +2256,16 @@ func (l *Logger) Flush() {
 }
 
 // Close releases resources held by the logger.
-// In async mode: flushes the buffered writer and closes the log file.
-// In sync mode: flushes the shared buffered writer and closes the sync file.
+// In async mode: flushes the buffered writer and closes the log file. It does
+// NOT stop the worker; call Flush(), then cancel the context passed to Start,
+// then Close (see the Quick Start).
+// In sync mode: flushes the shared buffered writer (and fsyncs for
+// FsyncEveryN) and closes the sync file.
 func (l *Logger) Close() error {
 	if l.cfg.SyncMode {
-		// CRITICAL: Final flush for OSBuffered and FsyncEveryN tiers.
-		// This ensures all buffered data is persisted to disk before closing.
-		if l.syncBw != nil {
-			l.syncMu.Lock()
-			l.syncBw.Flush()
-			l.syncMu.Unlock()
-		}
+		// Final flush for OSBuffered and FsyncEveryN (fsync for the latter),
+		// so no buffered entry is left in process memory.
+		l.syncFlush()
 		if l.syncFile != nil && l.syncFile != os.Stderr {
 			return l.syncFile.Close()
 		}
@@ -2242,21 +2423,23 @@ var rateLimitFallbackEpochMs = time.Now().UnixMilli()
 //
 // limit is the max logs per window. window is the duration, for example
 // time.Second or 500 * time.Millisecond. Sub-second windows are supported.
+// The window is a fixed window that starts when the profile is registered,
+// so up to 2*limit entries can pass around a window boundary.
 //
-// GATE ORDER: Rate limiting is applied AFTER sampling.
-// If you configure both WithSampleRate(10) and WithRateLimit(100),
-// the rate limit applies to the *sampled* stream, not the raw input stream.
+// GATE ORDER (v1.4.x): rate limiting is applied BEFORE sampling. The limit
+// counts entries that passed the level filter, before sampling discards any.
+// With both WithRateLimit(100, time.Second) and WithSampleRate(10):
 //
-// Example: 500 logs/s input, WithSampleRate(10), WithRateLimit(100):
-//  1. Sampling: 500/10 = 50 logs pass
-//  2. Rate limit: 50 < 100, so all 50 pass
-//     Result: ~50 logs/s output (not 100)
+//  1. Input: 500 logs/s
+//  2. Rate limit: at most 100 logs per second are admitted
+//  3. Sampling: 1 out of 10 admitted logs is written
+//     Result: ~10 logs/s are written (not 100).
 //
-// This design preserves hot-path performance by avoiding time.Now() syscalls
-// (~34ns) on entries that would be discarded by sampling anyway.
-//
-// If you need "max N raw attempts per second", do not combine sampling
-// with rate limiting. Use rate limiting alone.
+// So the rate limit is NOT a cap on the output when sampling is also set.
+// Because the rate limiter runs first, every call pays for one clock read
+// (~34ns) even if sampling would have discarded the entry. v1.5.0 is planned
+// to switch to sampling first (see ROADMAP.md); the example above would then
+// yield min(500/10, 100) = 50 logs/s.
 //
 // Exact counting supports limits up to rlMaxExactLimit (16,777,215).
 // Larger limits are capped to that value.
@@ -2344,9 +2527,14 @@ func checkAtomicRateLimitAt(p *SubProfile, nowMs int64) bool {
 
 		var next uint64
 
-		if win != nowWin {
+		if win < nowWin {
+			// Our timestamp opens a newer window: reset the counter.
 			next = (nowWin << rlCountBits) | 1
 		} else {
+			// win >= nowWin. win > nowWin means this caller read its clock
+			// before another goroutine advanced the window; count the call
+			// against the newer window instead of moving the state back
+			// (which would let up to `limit` extra entries through).
 			if cnt >= limit {
 				return false
 			}

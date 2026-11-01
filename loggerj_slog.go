@@ -34,9 +34,6 @@ type SlogHandler struct {
 
 	// group is the current WithGroup prefix.
 	group string
-
-	// fieldPool amortizes the per-Handle []Field slice allocation.
-	fieldPool *sync.Pool
 }
 
 // slogFieldPool is a package-level pool of []Field slices used by
@@ -52,9 +49,8 @@ var slogFieldPool = sync.Pool{
 // given Logger under the specified logType.
 func NewSlogHandler(l *Logger, logType string) *SlogHandler {
 	return &SlogHandler{
-		logger:    l,
-		logType:   logType,
-		fieldPool: &slogFieldPool,
+		logger:  l,
+		logType: logType,
 	}
 }
 
@@ -67,7 +63,12 @@ func (h *SlogHandler) Enabled(ctx context.Context, level slog.Level) bool {
 func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
 	level := slogToLoggerjLevel(r.Level)
 
-	bp := h.fieldPool.Get().(*[]Field)
+	// Filtered records: skip the attribute conversion and the context lookups.
+	if level < Level(h.logger.currentLevel.Load()) {
+		return nil
+	}
+
+	bp := slogFieldPool.Get().(*[]Field)
 	fields := (*bp)[:0]
 
 	// Prepend pre-converted WithAttrs fields.
@@ -78,6 +79,9 @@ func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
 		fields = h.appendAttr(fields, a)
 		return true
 	})
+
+	// Trace/request/span IDs from the context, like the *Ctx methods.
+	fields = appendCtxFieldsTyped(ctx, fields)
 
 	// Dispatch through the typed-field hot path.
 	// r.PC is the exact call site recorded by slog; passing it avoids guessing
@@ -93,7 +97,7 @@ func (h *SlogHandler) Handle(ctx context.Context, r slog.Record) error {
 		clear(fields) // drop string references held by pooled elements
 		*bp = fields[:0]
 	}
-	h.fieldPool.Put(bp)
+	slogFieldPool.Put(bp)
 
 	return nil
 }

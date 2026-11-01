@@ -37,53 +37,47 @@ Theme: **Correctness of docs and sync mode.** See CHANGELOG.md for the list. Beh
 
 ---
 
-## 🔮 v1.5.0 — Future
+## ✅ v1.5.0 — Completed
 
-Theme: **Ecosystem Integration & Production Durability.**
+Theme: **Throughput, lifecycle and cleanup.** See CHANGELOG.md.
 
-### Phase 0: Gate Order — Sampling First (decided)
+- [x] Worker batch drain with one clock read per batch (measured +44% to +50% delivered/s).
+- [x] Sampling before the rate limit.
+- [x] `StartBackground`, `Close()` stops the worker, `Flush()` keeps entries when no worker runs.
+- [x] Monotonic clock for the rate limiter (replaces the coarse-time cache idea; no cache, no jitter).
+- [x] `Sub` / `SubLogger` handle.
+- [x] `DurationUnit`, `TimestampFormat`, `FileMode`, `ErrorBlockTimeout`, `Stats.DropsByLevel`.
+- [x] Text output escapes control characters; reserved `WithFields` keys are ignored.
+- [x] slog adapter reads context IDs.
+- [x] Drop-free `Log_Enqueue_*` benchmarks as regression gates; `loggerj.go` split into topic files.
 
-- [ ] **Run sampling before the rate limit.** Sampling then costs one atomic add, the clock read is only paid for sampled entries, and `WithRateLimit` caps the output (`min(input/sampleRate, limit)`). This changes the output of profiles that use both options, so it is a behavior change: update `TestLog_RateLimitAndSampling_Order`, godoc, EXAMPLES §7 and COMPARISON, and call it out in the changelog.
+---
 
-### Phase 1: Coarse-Time Cache (P0)
+## 🔮 Next (not scheduled)
 
-- [ ] **`Config.RateLimitCoarseTime`** — Opt-in async-updated coarse timestamp for rate limiting (~1ns read vs 34ns vDSO).
-- [ ] **Documentation** — Warn that sub-second windows <50ms are not recommended with coarse time.
+### Measure first
 
-### Phase 2: True Nested JSON Objects (P1)
+- [ ] Profile the async path on Linux; lock and clock costs differ from macOS.
+- [ ] Defer caller resolution to the worker: store the PC and resolve it with `runtime.CallersFrames`. Verify how `runtime.Callers` with a one-element buffer behaves for inlined frames across Go 1.21-1.24 before shipping.
+- [ ] Bounded MPSC ring buffer of pre-allocated entries instead of channel + `sync.Pool` (the v1.4.4 profile showed channel lock and pool contention).
+- [ ] Rotation check on the `Flush()` path.
 
-- [ ] **Pre-compiled nested profiles** — `WithNestedFields` for static nested JSON baked at init time (0ns hot-path cost).
-- [ ] **`ObjectEncoder` interface** — zap-compatible dynamic nested JSON for sync mode (allocates; documented trade-off).
+### Sync mode
 
-### Phase 3: OpenTelemetry & Observability (P1)
+- [ ] Size-based rotation in sync mode.
+- [ ] Shorter `syncMu` hold time: swap the buffer under the lock, write and fsync outside it. Group commit only if that is not enough.
 
-- [ ] **OTel trace context extraction** — Opt-in via build tag. Zero cost when not compiled in.
-- [ ] **Prometheus metrics collector** — Optional sub-package exporting `loggerj_drops_total`, etc.
+### Output
 
-### Phase 4: Hook System & PII Masking (P2)
+- [ ] Nested JSON objects (`WithNestedFields` baked at init; allocating encoder interface only for sync mode).
+- [ ] OpenTelemetry trace context behind a build tag; Prometheus collector as a sub-package.
+- [ ] Redaction: a static key set applied by the worker, rather than per-call hooks.
 
-- [ ] **Pre-format hook API** — `AddHook(func(e *Entry))` runs on caller's goroutine.
-- [ ] **Field-level hook API** — `AddFieldHook(func(f Field) Field)` for per-field masking (PII redaction).
+### Dropped
 
-### Phase 5: Advanced Output (P2)
-
-- [ ] **Multi-writer fan-out** — `Config.Writers []io.Writer` for simultaneous stderr + file + network output.
-- [ ] **Network shipping** — Optional `loggerj/network` sub-package for TCP/UDP log shipping.
-
-### Candidates from the v1.4.3 review (not decided yet)
-
-- [ ] `Close()` stops and waits for the worker (idempotent); a way to wait for worker start so `Flush()` cannot discard entries.
-- [ ] Cheaper rate-limit clock (monotonic `time.Since` instead of `time.Now`) before considering a coarse-time cache.
-- [ ] Per-profile handle API (`logger.Sub(...)`) to skip the profile lookup and avoid typos in the log type.
-- [ ] Escape newlines in text output; reserved-key check in `WithFields`.
-- [ ] Per-level drop counters or an option to never drop errors.
-- [ ] Defer caller resolution (`runtime.Callers` PC) to the worker.
-- [ ] Numeric durations in JSON and a configurable timestamp format.
-
-### Deferred (Research Only)
-
-- [ ] **Group Commit (Option B)** — Leader/follower batching for sync logging (`writev`).
-- [ ] **Plugin / Core interface** — Intentionally deferred; conflicts with zero-overhead design.
+- Multi-writer fan-out: `io.MultiWriter` with `StartWithWriter` already does it.
+- Network shipping: out of scope.
+- Plugin / Core interface: conflicts with the zero-overhead design.
 
 ---
 

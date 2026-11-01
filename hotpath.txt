@@ -1,0 +1,6 @@
+BenchmarkLog_Filtered
+BenchmarkLog_RateLimited
+BenchmarkLog_Enqueue_NoFields
+BenchmarkLog_Enqueue_StringAPI
+BenchmarkLog_Enqueue_TypedFields
+BenchmarkLog_Enqueue_Slog

@@ -920,6 +920,15 @@ func BenchmarkLog_RateLimited_HighContention(b *testing.B) {
 	reportDrops(b, logger)
 }
 
+// BenchmarkMonoMillis isolates the cost of the monotonic clock read the rate
+// limiter uses since v1.5.0; compare with BenchmarkTimeNowUnixMilli.
+func BenchmarkMonoMillis(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = monoMillis()
+	}
+}
+
 // BenchmarkTimeNowUnixMilli isolates the vDSO cost of time.Now().UnixMilli()
 // on the host OS. This is the unavoidable baseline cost paid on every
 // rate-limited log call in the current design.
@@ -950,19 +959,19 @@ func BenchmarkCheckAtomicRateLimit_WithoutTime(b *testing.B) {
 }
 
 // BenchmarkCheckAtomicRateLimit_RealWorld measures the actual hot-path
-// cost including the time.Now() vDSO call.
+// cost including the clock read.
 func BenchmarkCheckAtomicRateLimit_RealWorld(b *testing.B) {
 	p := &SubProfile{
 		rlLimit:    1_000_000,
 		rlWindowMs: 1000,
-		rlStartMs:  time.Now().UnixMilli(),
+		rlStartMs:  monoMillis(),
 	}
 
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		// This calls time.Now() inside, exactly like the real hot-path.
-		_ = checkAtomicRateLimitAt(p, time.Now().UnixMilli())
+		// Same clock read as the real hot path.
+		_ = checkAtomicRateLimitAt(p, monoMillis())
 	}
 }
 
@@ -1003,6 +1012,11 @@ func benchmarkE2E(b *testing.B, cfg Config, logFn func(l *Logger)) {
 	b.ReportMetric(float64(drops)/float64(b.N), "drops/op")
 	if elapsed > 0 {
 		b.ReportMetric(float64(delivered)/elapsed.Seconds(), "delivered/s")
+	}
+	// ns/op divides by ALL attempts, including cheap drops, so it rises when
+	// fewer attempts are dropped. Compare ns/delivered or delivered/s instead.
+	if delivered > 0 {
+		b.ReportMetric(float64(elapsed.Nanoseconds())/float64(delivered), "ns/delivered")
 	}
 }
 
@@ -1048,4 +1062,113 @@ func BenchmarkSyncMode_FsyncEveryN(b *testing.B) {
 	}
 	b.StopTimer()
 	logger.Close()
+}
+
+// -----------------------------------------------------------------------------
+// Enqueue-only benchmarks (regression gates for the caller-side cost)
+// -----------------------------------------------------------------------------
+
+// benchmarkEnqueue measures the caller-side cost of a log call that is really
+// enqueued. No worker runs during the timed region, the channel is large
+// enough that nothing is dropped, and the queue is emptied between chunks
+// outside the timer.
+//
+// It is a lower bound for async callers: there is no producer/worker
+// contention on the channel lock and the entry pool stays warm. Use it for
+// regression gates, because the ns/op of the BenchmarkLog_* family depends on
+// how many attempts the worker lets through (drops/op); use BenchmarkE2E_*
+// for delivered throughput.
+func benchmarkEnqueue(b *testing.B, cfg Config, logFn func(l *Logger)) {
+	const chunk = 1 << 16
+	cfg.ChannelSize = chunk
+	logger := NewLogger(cfg)
+
+	drain := func() {
+		for len(logger.logCh) > 0 {
+			e := <-logger.logCh
+			e.Reset()
+			logger.pool.Put(e)
+		}
+	}
+
+	// Warm the entry pool so pool misses are not part of the measurement.
+	for i := 0; i < chunk; i++ {
+		logFn(logger)
+	}
+	drain()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for done := 0; done < b.N; {
+		n := b.N - done
+		if n > chunk {
+			n = chunk
+		}
+		for i := 0; i < n; i++ {
+			logFn(logger)
+		}
+		done += n
+
+		b.StopTimer()
+		drain()
+		b.StartTimer()
+	}
+	if d := logger.Drops(); d != 0 {
+		b.Fatalf("enqueue benchmark dropped %d entries", d)
+	}
+}
+
+func BenchmarkLog_Enqueue_NoFields(b *testing.B) {
+	benchmarkEnqueue(b, Config{}, func(l *Logger) {
+		l.Log(LevelInfo, "TEST", []byte("message"))
+	})
+}
+
+func BenchmarkLog_Enqueue_StringAPI(b *testing.B) {
+	benchmarkEnqueue(b, Config{}, func(l *Logger) {
+		l.InfoString("TEST", "message", "key1", "value1")
+	})
+}
+
+func BenchmarkLog_Enqueue_TypedFields(b *testing.B) {
+	status, latency := 200, 50*time.Millisecond
+	benchmarkEnqueue(b, Config{JSONOutput: true}, func(l *Logger) {
+		l.InfoFields("HTTP", []byte("request"),
+			Int("status", status),
+			Dur("latency", latency),
+			Bool("cached", true),
+			Str("method", "GET"),
+		)
+	})
+}
+
+// BenchmarkLog_Enqueue_Sub is BenchmarkLog_Enqueue_StringAPI through a
+// SubLogger handle. With a small registry the handle is not faster: the
+// profile lookup it skips is cheap.
+func BenchmarkLog_Enqueue_Sub(b *testing.B) {
+	var sub *SubLogger
+	benchmarkEnqueue(b, Config{}, func(l *Logger) {
+		if sub == nil {
+			sub = l.Sub("TEST")
+		}
+		sub.InfoString("message", "key1", "value1")
+	})
+}
+
+// BenchmarkLog_Enqueue_Slog measures the slog adapter's Handle on a pre-built
+// record, enqueued without drops and without a running worker. Unlike
+// BenchmarkSlogHandler_Handle its ns/op does not depend on how fast the worker
+// drains the channel.
+func BenchmarkLog_Enqueue_Slog(b *testing.B) {
+	var handler *SlogHandler
+	ctx := context.Background()
+	r := slog.NewRecord(time.Now(), slog.LevelInfo, "request", 0)
+	r.AddAttrs(slog.String("method", "GET"), slog.Int("status", 200))
+
+	benchmarkEnqueue(b, Config{JSONOutput: true}, func(l *Logger) {
+		if handler == nil {
+			handler = NewSlogHandler(l, "SLOG")
+		}
+		_ = handler.Handle(ctx, r)
+	})
 }

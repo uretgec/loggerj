@@ -6,6 +6,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.5.0] - 2026-10-31
+
+Minor release: faster worker, simpler lifecycle, new options, and several behavior changes. Read "Upgrading" before updating a service that depends on log volume or on the exact text output.
+
+### Added
+
+- `StartBackground(ctx)` and `StartBackgroundWithWriter(ctx, w)`: start the worker in its own goroutine and return once it is running, so `Flush()` can be called right away. `Start` / `StartWithWriter` are unchanged (blocking, started with `go`).
+- `Logger.Sub(logType, opts...)` and `SubLogger`: a handle to a registered profile (`Debug/Info/Warn/Error`, `...String`, `...Fields`), so a typo in the log type cannot silently lose the profile. It is a safety feature, not a speed-up (see BENCH.md). `Sub` without options reuses an existing profile.
+- `Config.DurationUnit`: numeric JSON durations in a chosen unit (default: string form).
+- `Config.TimestampFormat`: timestamps as a formatted UTC time instead of Unix milliseconds.
+- `Config.FileMode`: permissions for the log file and its rotated replacement (default `0o644`).
+- `Config.ErrorBlockTimeout`: optional bounded wait for ERROR entries when the channel is full.
+- `Stats.DropsByLevel`: drops per level (`[4]uint64`, indexed by `Level`).
+- slog adapter: trace/request/span IDs from the context (`TraceIDKey`, `RequestIDKey`, `SpanIDKey`), like the `*Ctx` methods.
+- Benchmarks: `BenchmarkLog_Enqueue_*` (caller-side cost without drops, including `Enqueue_Sub` and `Enqueue_Slog`), `BenchmarkMonoMillis`; `BenchmarkE2E_*` also reports `ns/delivered`.
+
+### Performance
+
+- **Worker batch drain:** the worker formats up to 128 already-queued entries per pass instead of going through its four-channel `select` for every entry, and reads the clock once per batch. On the v1.4.4 profile (Apple M1 Pro, saturating producer) `select` was ~57% and `time.Now` ~23% of the worker's time, formatting ~3%. Measured with `benchstat` (`-count=6`, p=0.002): `BenchmarkE2E_NoFields_Text` delivered/s 3.52M -> 5.28M (+50%), `drops/op` 0.80 -> 0.18; `BenchmarkE2E_TypedFields_JSON` delivered/s 2.50M -> 3.61M (+44%), `drops/op` 0.79 -> 0.64. Sync-mode benchmarks and `BenchmarkLog_Enqueue_*` are unchanged. The `ns/op` of the async `BenchmarkLog_*` benchmarks rises because fewer attempts take the cheap drop path.
+- **Rate-limit clock:** the limiter reads the monotonic clock only (`time.Since` on a fixed epoch) instead of `time.Now()`. Windows no longer move with wall-clock adjustments. On an Apple M1 Pro the clock read dropped from 33.8 ns (`time.Now().UnixMilli()`) to 16.4 ns (`BenchmarkMonoMillis`), and `BenchmarkLog_RateLimited` from 38.2 ns to 25.2 ns.
+- **Sampling before the rate limit:** entries discarded by sampling no longer pay for the limiter's clock read.
+- The slog adapter skips the attribute conversion for filtered records and no longer allocates for messages longer than 32 bytes (v1.4.4).
+- Removed the `//go:nosplit` pragmas (no measured benefit). `BenchmarkLog_Filtered` and `BenchmarkLog_Enqueue_*` are unchanged without them.
+
+### Changed (behavior)
+
+- **Gate order:** sampling now runs before the rate limit (it was the other way round in v1.4.x). `WithRateLimit` therefore caps what is written, and entries discarded by sampling no longer use up the limit. With `WithRateLimit(100, time.Second)` + `WithSampleRate(10)` and 500 attempts/s the output changes from ~10 to 50 logs/s.
+- **`Close()` stops the worker.** It cancels the worker, waits (up to 5 seconds) for it to drain the channel and exit, then flushes and closes the file. `StartBackground(ctx)` + `defer Close()` is a complete lifecycle; `Flush(); cancel(); Close()` still works. `Close()` is idempotent (later calls return nil).
+- **`Flush()` without a running worker no longer discards the queued entries.** It returns immediately and the entries are written when a worker starts (or counted in `Drops()` if the channel fills up first).
+- **Text output escapes control characters** in messages and field values: `\n` and `\r` are written as the two characters `\n` and `\r`, other control characters and DEL as `\xNN`; tabs are kept. A value can no longer start a new log line. Keys are not escaped.
+- **`WithFields` keys `ts`, `level`, `type`, `msg`, `file`, `line` and `fields` are ignored** with a warning (they produced duplicate JSON keys).
+- Entries formatted in the same batch carry the same `ts` (millisecond resolution; a batch is formatted within microseconds). Sync mode still stamps at call time.
+- `Flush()` writes at `FlushThreshold` while draining instead of accumulating the whole channel in the buffer first. Rotation is still only checked by the worker's threshold and ticker writes, not by `Flush()`.
+- The slog adapter's `Handle` returns early for records below the logger's level.
+
+### Deprecated
+
+- `Config.RateLimitWindow`: `WithRateLimit` always sets its own window. The field is kept for compatibility.
+
+### Repository
+
+- `loggerj.go` was split into topic files (`config.go`, `profile.go`, `field.go`, `entry.go`, `logger.go`, `api.go`, `core.go`, `worker.go`, `format.go`, `rotate.go`, `ratelimit.go`, `sublogger.go`); no declaration was changed by the split.
+- `hotpath.txt` now protects `Log_Filtered`, `Log_RateLimited` and the `Log_Enqueue_*` benchmarks (including `Enqueue_Slog`). The drop-mixed `BenchmarkLog_*` benchmarks are informational: their `ns/op` depends on how fast the worker is.
+
+### Upgrading
+
+1. If you combine `WithSampleRate` and `WithRateLimit`, expect more output; use `WithRateLimit(limit/sampleRate, window)` for the old volume.
+2. If you parse the text format, note the escaping of control characters.
+3. If you registered `WithFields` keys that are now reserved, rename them.
+4. The previous shutdown order keeps working; you can replace it with `StartBackground` + `defer Close()`.
+
+### Not included (see ROADMAP.md)
+
+Caller resolution in the worker, a ring-buffer queue, rotation in sync mode, a shorter `syncMu` hold time, nested JSON objects, OpenTelemetry and redaction hooks.
+
+---
+
 ## [1.4.4] - 2026-10-26
 
 Patch release: bug fixes and documentation corrections. The gate order (rate limit before sampling) is unchanged; switching to sampling first is planned for v1.5.0.
@@ -68,7 +125,7 @@ Patch release: bug fixes and documentation corrections. The gate order (rate lim
 - **Rate-limit cost math fix:** Corrected total real-world cost calculation to ~36.5ns.
 - **slog time.Time precision fix:** Changed `time.RFC3339` to `time.RFC3339Nano` in `SlogHandler` to preserve sub-second precision for audit trails.
 
-### Testing
+### Testing#2
 
 - **Build tag test files:** Split `TestAsWriter_ZeroAlloc` into Go 1.21 and Go 1.22+ specific files.
 - **New test:** `TestSlogHandler_TimePrecision` verifies nanosecond preservation.

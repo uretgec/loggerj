@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue?style=for-the-badge" alt="License: MIT">
   <img src="https://img.shields.io/badge/Go-1.21+-00ADD8?style=for-the-badge&logo=go" alt="Go Version">
-  <img src="https://img.shields.io/badge/version-v1.4.4-green?style=for-the-badge" alt="Version: 1.4.4">
+  <img src="https://img.shields.io/badge/version-v1.5.0-green?style=for-the-badge" alt="Version: 1.5.0">
 </p>
 
 # loggerj
@@ -14,11 +14,16 @@ High-performance, zero-allocation asynchronous logging for Go.
 
 - **Asynchronous Pipeline**: Non-blocking channel + dedicated worker goroutine.
 - **Zero-Allocation Typed Fields**: `Int()`, `Bool()`, `Dur()` without interface boxing.
-- **Lock-Free Rate Limiting & Sampling**: `atomic.CompareAndSwap` (CAS) with bounded backoff for rate limiting, an atomic counter for sampling. Both run before the sync/async split, so they apply in both modes. In v1.4.x the rate limit runs before sampling (see `WithRateLimit`).
+- **Lock-Free Rate Limiting & Sampling**: `atomic.CompareAndSwap` (CAS) with bounded backoff for rate limiting, an atomic counter for sampling. Both run before the sync/async split, so they apply in both modes. Since v1.5.0 sampling runs before the rate limit (see `WithRateLimit`).
 - **Pre-baked SubProfiles**: Static fields formatted once at init, injected via `memcpy` at log time.
 - **Sync Mode with Durability Tiers**: 4 explicit tiers. Only `Direct` and `FsyncEveryWrite` survive a process crash for every entry; `OSBuffered` and `FsyncEveryN` keep entries in a process-memory buffer (see the table below). `Direct` and `FsyncEveryWrite` take no loggerj mutex; `OSBuffered` and `FsyncEveryN` hold a mutex around the shared `bufio.Writer` during buffer copy AND flush/fsync.
 - **Native log rotation** — size-based with backup retention, zero external dependencies, async mode only (ignored in Sync Mode). No time-based rotation, no compression. For daily rotation or gzip, use lumberjack via `StartWithWriter()`.
-- **slog.Handler Adapter**: Routes standard `log/slog` calls through loggerj's zero-alloc pipeline.
+- **slog.Handler Adapter**: Routes standard `log/slog` calls through loggerj's zero-alloc pipeline; trace/request/span IDs from the context are added.
+- **Simple lifecycle**: `StartBackground(ctx)` + `defer Close()`. `Close()` drains the queue, stops the worker and closes the file.
+- **SubLogger handles**: `logger.Sub("HTTP", opts...)` returns a handle bound to a profile, so a typo in the log type cannot silently drop the profile's rate limit, sampling and static fields. It is a safety feature, not a speed-up.
+- **Overload visibility**: `Stats().Drops` and `Stats().DropsByLevel`; optional bounded wait for ERROR entries (`ErrorBlockTimeout`).
+- **Output options**: numeric JSON durations (`DurationUnit`), formatted timestamps (`TimestampFormat`), log file permissions (`FileMode`).
+- **Safe text output**: control characters in messages and values are escaped, so a value cannot start a new log line.
 
 ## Quick Start
 
@@ -46,13 +51,8 @@ func main() {
     )
 
     // 3. Start the async worker
-    ctx, cancel := context.WithCancel(context.Background())
-    go logger.Start(ctx)
-    defer func() {
-        logger.Flush() // drain the channel while the worker is still running
-        cancel()       // stop the worker
-        logger.Close() // close the file
-    }()
+    logger.StartBackground(context.Background())
+    defer logger.Close() // drains queued entries, stops the worker, closes the file
 
     // 4. Log messages (HOT PATH: zero allocation)
     logger.InfoString("HTTP", "request received", "method", "GET", "path", "/api")
@@ -97,6 +97,29 @@ log.Println("This message flows through loggerj's async pipeline")
 | Sync `FsyncEveryWrite` | Yes | Yes, if the disk honors fsync |
 
 In Sync Mode, `Flush()` and `Close()` flush the buffer of `OSBuffered` and `FsyncEveryN` (and fsync for `FsyncEveryN`). The process-crash column is verified by `TestDurability_ProcessKill`; OS crash behavior is not tested.
+
+## Output format
+
+JSON output is one object per line:
+
+```json
+{"ts":1704067200123,"level":"INFO","type":"HTTP","env":"prod","msg":"request","fields":{"status":200,"latency":"150ms"}}
+```
+
+- `ts`, `level`, `type` and `msg` are always present. `file` and `line` are added with `IncludeCaller`.
+- Fields from `WithFields` are top-level keys (baked at registration). Fields passed per call are nested under `"fields"`. `WithFields` keys named `ts`, `level`, `type`, `msg`, `file`, `line` or `fields` are reserved and ignored with a warning.
+- Dotted keys are used instead of nested objects (`"http.method"`); see COMPARISON.md.
+- `ts` is Unix milliseconds unless `TimestampFormat` is set. In async mode it is taken by the worker, once per batch of queued entries, not when the log call is made.
+
+## Upgrading from v1.4.x
+
+v1.5.0 changes some behavior; see CHANGELOG.md for details.
+
+- **Gate order:** sampling now runs before the rate limit, so the same `WithSampleRate` + `WithRateLimit` configuration writes more. Use `WithRateLimit(limit/sampleRate, window)` to keep the old volume.
+- **Shutdown:** `Close()` now stops the worker. `Flush(); cancel(); Close()` still works; `StartBackground` + `defer Close()` is enough.
+- **`Flush()` without a running worker** no longer discards queued entries.
+- **Text output** escapes control characters; parsers that relied on raw newlines inside values will see `\n`.
+- **`WithFields` keys** that collide with the JSON keys listed above are ignored.
 
 ## Performance & Trade-offs
 

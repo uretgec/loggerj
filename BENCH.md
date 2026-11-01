@@ -60,7 +60,20 @@ The worker now formats queued entries in batches (one `select` and one clock rea
 | `Log_Enqueue_StringAPI` | ~30 |
 | `Log_Enqueue_TypedFields` | ~47.5 |
 
-These are the benchmarks protected by `hotpath.txt` (together with `Log_Filtered` and `Log_RateLimited`).
+These are the benchmarks protected by `hotpath.txt` (together with `Log_Filtered`, `Log_RateLimited` and `Log_Enqueue_Slog`).
+
+Other v1.5.0 measurements (same machine, `-count=6`):
+
+| Benchmark | v1.4.4 | v1.5.0 |
+|---|---:|---:|
+| `Log_Filtered` | 2.04 ns | 2.03 ns |
+| `Log_RateLimited` | 38.2 ns | 25.2 ns |
+| clock read: `time.Now().UnixMilli()` / `monoMillis()` | 33.8 ns | 16.4 ns |
+| `Log_Enqueue_NoFields` | 28.3 ns | 28.2 ns |
+| `Log_Enqueue_StringAPI` | 30.6 ns | 29.7 ns |
+| `Log_Enqueue_TypedFields` | 47.9 ns | 47.5 ns |
+
+`Log_Enqueue_Sub` (a `SubLogger` handle) measured 31.2 ns against 29.7 ns for the same call through `InfoString("TEST", ...)` in the same build, so with a small registry the handle is not faster: the profile lookup it skips is a short linear scan, and the handle adds one more call. Use `SubLogger` for safety (a typo cannot lose the profile), not for speed.
 
 ## 1. Async Mode (Intended Usage)
 
@@ -100,6 +113,8 @@ Sync Mode bypasses the async pipeline. Each tier has a different guarantee (see 
 
 ## 3. Rate-Limit Hot-Path Cost Breakdown
 
+The numbers in this section are the v1.4.3 measurements, taken with `time.Now().UnixMilli()`. Since v1.5.0 the limiter reads only the monotonic clock (`monoMillis`), which is immune to wall-clock adjustments; `BenchmarkMonoMillis` measures it: about 16.4 ns against about 33.8 ns for `time.Now().UnixMilli()` on an Apple M1 Pro.
+
 loggerj uses a lock-free, single-word CAS design for rate limiting.
 
 | Component | ns/op | % of Total | Allocs |
@@ -118,7 +133,7 @@ loggerj uses a lock-free, single-word CAS design for rate limiting.
 
 ### Why No Coarse-Time Cache?
 
-We intentionally do not use an async-updated coarse timestamp cache. While it would save ~34ns/op, it introduces severe jitter for sub-second rate-limit windows (e.g., a 50ms window might effectively last 40ms or 60ms depending on cache alignment). The ~34ns clock-read cost is accepted to guarantee exact, deterministic window boundaries.
+We intentionally do not use an async-updated coarse timestamp cache. While it would save ~34ns/op, it introduces severe jitter for sub-second rate-limit windows (e.g., a 50ms window might effectively last 40ms or 60ms depending on cache alignment). The ~34ns clock-read cost is accepted to guarantee exact, deterministic window boundaries. (Since v1.5.0 the limiter uses a single monotonic clock read instead, which needs no cache and keeps the windows exact.)
 
 ---
 

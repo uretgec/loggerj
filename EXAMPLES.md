@@ -71,6 +71,7 @@ Comprehensive examples for all `loggerj` features, configurations, and the Pre-C
   - [21. slog.Group Multi-Key Flattening (v1.4.0)](#21-sloggroup-multi-key-flattening-v140)
     - [Nested Groups](#nested-groups)
     - [Why Dotted Keys Instead of Nested JSON?](#why-dotted-keys-instead-of-nested-json)
+  - [22. v1.5.0 Additions](#22-v150-additions)
   - [Summary](#summary)
 
 ---
@@ -415,7 +416,7 @@ logger.RegisterSub("API",
 - 5,000 raw attempts/sec → 500 kept by sampling → 100 pass the rate limit → **100 logs/sec written** (the limit is a cap)
 
 Entries discarded by sampling do not use up the rate limit and do not pay for
-its clock read (~34 ns).
+its clock read.
 
 **Upgrading from v1.4.x:** the rate limiter used to run first, so the limit
 counted entries before sampling, and the configuration above wrote ~10 logs/sec
@@ -1345,6 +1346,73 @@ True nested JSON objects would require either:
 Dotted keys preserve the zero-allocation guarantee while working well with
 modern log aggregation pipelines that treat dotted keys as equivalent to
 nested objects for indexing and querying.
+
+---
+
+## 22. v1.5.0 Additions
+
+### Worker lifecycle
+
+```go
+logger := loggerj.NewLogger(loggerj.Config{JSONOutput: true})
+logger.StartBackground(context.Background()) // returns once the worker is running
+defer logger.Close()                         // drains queued entries, stops the worker, closes the file
+```
+
+`Start` / `StartWithWriter` still block and are started with `go`. `Close()` can be called more than once.
+
+### SubLogger handle
+
+```go
+http := logger.Sub("HTTP",
+    loggerj.WithRateLimit(1000, time.Second),
+    loggerj.WithFields("service", "gateway"),
+)
+http.InfoString("request received", "method", "GET")
+http.ErrorFields([]byte("upstream failed"), loggerj.Int("status", 502))
+```
+
+`Sub` with options registers (or replaces) the profile; `Sub("HTTP")` without options reuses the registered one and never resets its rate limit. A handle keeps the profile it was created with.
+
+Use it for safety, not speed: the handle skips the profile lookup, but with a small registry that lookup is cheap, and the handle measured about 1.5 ns slower than `InfoString("HTTP", ...)` (BENCH.md).
+
+### Output options
+
+```go
+logger := loggerj.NewLogger(loggerj.Config{
+    JSONOutput:      true,
+    DurationUnit:    time.Millisecond, // "latency":150 or 1.5 instead of "150ms"
+    TimestampFormat: time.RFC3339Nano, // "ts":"2026-10-30T12:00:00.123Z" instead of Unix ms
+    FileMode:        0o640,            // permissions of the log file (default 0o644)
+})
+```
+
+Text output always prints durations as `150ms`. The timestamp layout must not produce characters that need JSON escaping.
+
+### Overload: drops by level and a bounded wait for ERROR
+
+```go
+logger := loggerj.NewLogger(loggerj.Config{
+    ChannelSize:       4096,
+    ErrorBlockTimeout: 50 * time.Millisecond, // ERROR waits up to 50ms for space before it is dropped
+})
+
+st := logger.Stats()
+fmt.Println(st.Drops, st.DropsByLevel[loggerj.LevelError])
+```
+
+`ErrorBlockTimeout` makes the caller wait, so use it only where losing an error is worse than a slow call. With no running worker every ERROR call waits for the full timeout.
+
+### slog context fields
+
+```go
+ctx := context.WithValue(context.Background(), loggerj.TraceIDKey, "abc-123")
+slogger.InfoContext(ctx, "request") // adds "trace_id":"abc-123"
+```
+
+### JSON layout and reserved keys
+
+`WithFields` values are top-level keys; per-call fields are nested under `"fields"`. The keys `ts`, `level`, `type`, `msg`, `file`, `line` and `fields` are reserved: `RegisterSub` ignores `WithFields` pairs that use them and prints a warning to stderr.
 
 ---
 

@@ -13,7 +13,7 @@ An engineering comparison. We show where `loggerj` wins, where it loses, and the
 - **Structured logging**: `loggerj`'s `Field` API gives **0 allocs/op** for dynamic values, matching zap and beating slog variadic call sites.
 - **slog ecosystem**: Native `slog.Handler` adapter routes calls through loggerj's pipeline (~143 ns/op, 0 allocs). Groups are flattened to dotted keys.
 - **logrus**: `loggerj` wins everywhere; `logrus` is in maintenance mode.
-- **No configurable gate order (sampling vs rate limit).** Since v1.5.0 sampling runs before the rate limit, so the limit caps the output and the rate limiter's clock read (~34 ns) is only paid by entries that survived sampling. v1.4.x ran the rate limit first (output about `limit / sampleRate` per window).
+- **No configurable gate order (sampling vs rate limit).** Since v1.5.0 sampling runs before the rate limit, so the limit caps the output and the rate limiter's clock read is only paid by entries that survived sampling. v1.4.x ran the rate limit first (output about `limit / sampleRate` per window).
 
 ---
 
@@ -70,7 +70,8 @@ We believe in radical transparency. Here is every case where `loggerj` is **not*
 | **Delivery under overload / crash** | The async channel drops entries when full (counted in `Stats().Drops`), leaving gaps, and async mode gives no crash durability. | `SyncMode` (`Direct` / `FsyncEveryWrite`) |
 | **Timestamps** | In async mode `ts` is taken by the worker (once per batch of up to 128 queued entries), not when the log call is made; under backpressure it can lag the event. | **zap** / **zerolog** |
 | **Sync-mode rotation** | `MaxFileSize` / `MaxBackupFiles` are ignored in `SyncMode`. | logrotate (copytruncate) or lumberjack |
-| **Text-mode escaping** | Text output does not escape newlines or spaces in values; untrusted input can forge log lines. | Use `JSONOutput` for untrusted data |
+| **Text-mode value quoting** | Text output escapes control characters (a value cannot start a new log line) but does not quote values that contain spaces, so `key=value` parsing of such values is ambiguous. | `JSONOutput`, or zap / zerolog console encoders |
+| **JSON layout** | Per-call fields are nested under `"fields"`; `WithFields` static fields are top-level keys. Key names and layout are fixed. | zap / zerolog for configurable encoders |
 | **Rate-limit exact limit >16M** | Packed atomic state caps exact counting at 16,777,215 per window. | Use external rate limiter |
 
 ### Why No Nested JSON Objects?

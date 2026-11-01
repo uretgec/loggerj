@@ -13,7 +13,7 @@ An engineering comparison. We show where `loggerj` wins, where it loses, and the
 - **Structured logging**: `loggerj`'s `Field` API gives **0 allocs/op** for dynamic values, matching zap and beating slog variadic call sites.
 - **slog ecosystem**: Native `slog.Handler` adapter routes calls through loggerj's pipeline (~143 ns/op, 0 allocs). Groups are flattened to dotted keys.
 - **logrus**: `loggerj` wins everywhere; `logrus` is in maintenance mode.
-- **No configurable gate order (sampling vs rate limit).** In v1.4.x the rate limit runs before sampling. With both set, the rate limit counts entries before sampling, so the output is roughly `limit / sampleRate` per window, and every call pays one clock read (~34 ns) because the rate limiter runs first. v1.5.0 is planned to run sampling first (a behavior change); see ROADMAP.md.
+- **No configurable gate order (sampling vs rate limit).** Since v1.5.0 sampling runs before the rate limit, so the limit caps the output and the rate limiter's clock read (~34 ns) is only paid by entries that survived sampling. v1.4.x ran the rate limit first (output about `limit / sampleRate` per window).
 
 ---
 
@@ -68,7 +68,7 @@ We believe in radical transparency. Here is every case where `loggerj` is **not*
 | **Plugin / multi-sink composition** | No `zapcore.Core` equivalent (intentional). No tiered multi-sink. | **zap** for composable sinks |
 | **Production maturity** | v1.4.3 has comprehensive validation, but production track record is still limited compared to Uber's zap. | **zap** / **zerolog** for conservative teams |
 | **Delivery under overload / crash** | The async channel drops entries when full (counted in `Stats().Drops`), leaving gaps, and async mode gives no crash durability. | `SyncMode` (`Direct` / `FsyncEveryWrite`) |
-| **Timestamps** | In async mode `ts` is taken by the worker when it formats the entry, not when the log call is made; under backpressure it can lag the event. | **zap** / **zerolog** |
+| **Timestamps** | In async mode `ts` is taken by the worker (once per batch of up to 128 queued entries), not when the log call is made; under backpressure it can lag the event. | **zap** / **zerolog** |
 | **Sync-mode rotation** | `MaxFileSize` / `MaxBackupFiles` are ignored in `SyncMode`. | logrotate (copytruncate) or lumberjack |
 | **Text-mode escaping** | Text output does not escape newlines or spaces in values; untrusted input can forge log lines. | Use `JSONOutput` for untrusted data |
 | **Rate-limit exact limit >16M** | Packed atomic state caps exact counting at 16,777,215 per window. | Use external rate limiter |

@@ -23,7 +23,9 @@
 //     takes the Go runtime's internal channel lock. String-to-byte conversion
 //     uses unsafe zero-copy (Go 1.20+). Timestamps are taken by the worker
 //     when it formats the entry, not when Log is called: this removes a clock
-//     read from the hot path, but under backpressure ts reflects dequeue time.
+//     read from the hot path, but under backpressure ts reflects dequeue
+//     time. The worker reads the clock once per batch of up to 128 queued
+//     entries, so entries of one batch share the same ts.
 //  3. Worker: A dedicated goroutine formats entries, injects pre-baked
 //     []byte prefixes, and writes to the underlying io.Writer via bufio.
 //     Flush() drains the channel before writing, guaranteeing no log loss
@@ -48,12 +50,9 @@
 //	)
 //
 //	ctx, cancel := context.WithCancel(context.Background())
-//	go logger.Start(ctx)
-//	defer func() {
-//	    logger.Flush() // drain the channel while the worker is still running
-//	    cancel()       // stop the worker
-//	    logger.Close() // close the file
-//	}()
+//	defer cancel()
+//	logger.StartBackground(ctx)
+//	defer logger.Close() // drains queued entries, stops the worker, closes the file
 //
 //	// HOT PATH: Ultra-fast, zero-allocation logging
 //	logger.InfoString("HTTP", "request received", "method", "GET", "path", "/api")
@@ -364,11 +363,11 @@ type SubOption func(*SubProfile)
 // call; the first nine are dropped). Useful for high-volume debug traces
 // where statistical representation is sufficient.
 //
-// GATE ORDER (v1.4.x): when a profile also has WithRateLimit, the rate
-// limiter runs BEFORE the sampler. The sampler therefore only sees the
-// entries the rate limiter admitted, so the sampling ratio applies to the
-// rate-limited stream, not to the raw input. See WithRateLimit for a worked
-// example. v1.5.0 is planned to switch to sampling first (see ROADMAP.md).
+// GATE ORDER (v1.5.0+): when a profile also has WithRateLimit, sampling runs
+// BEFORE the rate limiter. The rate limiter therefore only sees (and counts)
+// the sampled entries, so WithRateLimit caps what is actually written. See
+// WithRateLimit for a worked example. Before v1.5.0 the rate limiter ran
+// first.
 //
 // The sampling counter is atomic and lock-free, supporting concurrent logging.
 func WithSampleRate(rate int64) SubOption {
@@ -625,6 +624,16 @@ type Logger struct {
 	// Prevents double-start panics and allows Flush() to bypass the worker
 	// channel synchronization when no worker is running.
 	running atomic.Bool
+
+	// workerMu guards workerCancel and workerStopped, which belong to the
+	// current (or last) worker run. Close uses them to stop the worker and
+	// wait for it to exit.
+	workerMu      sync.Mutex
+	workerCancel  context.CancelFunc
+	workerStopped chan struct{}
+
+	// closed makes Close idempotent.
+	closed atomic.Bool
 
 	// flushMu serializes Flush() calls. Flush is a cold-path operation,
 	// so a mutex is acceptable and eliminates the need for complex
@@ -1132,35 +1141,34 @@ func appendCtxFields(ctx context.Context, fields []string) []string {
 // the level check has already been performed by the caller (the level check
 // is inlined into log()/logTyped() for the ~2ns filtered fast-path).
 //
-// Order of operations (v1.4.x; documented in WithRateLimit/WithSampleRate):
-//  1. Rate limit (admission control): rejects entries over the quota. It
-//     costs one clock read (~34ns) on every call, including calls that
-//     sampling would have discarded.
-//  2. Sampling: selects 1-out-of-N of the ADMITTED entries.
+// Order of operations (v1.5.0+; documented in WithRateLimit/WithSampleRate):
+//  1. Sampling: one atomic add; keeps 1 out of N entries.
+//  2. Rate limit (admission control): rejects sampled entries over the
+//     quota. It costs one clock read (~34ns), paid only by entries that
+//     survived sampling.
 //
-// The sampling ratio therefore applies to the rate-limited stream, not to
-// the raw input. v1.5.0 is planned to run sampling first (cheaper, and the
-// rate limit then caps the output). That is a behavior change and is not
-// done in a patch release.
+// The rate limit therefore caps the output. Before v1.5.0 the rate limiter
+// ran first, which made the limit count entries before sampling.
 //
 //go:nosplit
 func (l *Logger) checkGatesAfterLevel(logType string) (*SubProfile, bool) {
 	// 1. Lock-free profile lookup (atomic.Pointer + linear scan / map)
 	p := l.getProfile(logType)
 
-	// 2. Lock-free rate limiting (atomic CAS)
-	// Runs before sampling in v1.4.x. Under saturation the CAS is skipped,
-	// but the clock read performed by checkAtomicRateLimit is still paid.
-	if p.rlLimit > 0 {
-		if !l.checkAtomicRateLimit(p) {
+	// 2. Lock-free sampling (atomic.Add)
+	// Runs first: one atomic add, and no clock read for discarded entries.
+	if p.sampleRate > 0 {
+		if p.sampleCount.Add(1)%p.sampleRate != 0 {
 			return nil, false
 		}
 	}
 
-	// 3. Lock-free sampling (atomic.Add)
-	// Applies to the entries admitted by the rate limiter.
-	if p.sampleRate > 0 {
-		if p.sampleCount.Add(1)%p.sampleRate != 0 {
+	// 3. Lock-free rate limiting (atomic CAS)
+	// Applies to the sampled entries, so the limit caps the output. Under
+	// saturation the CAS is skipped, but the clock read performed by
+	// checkAtomicRateLimit is still paid by every sampled entry.
+	if p.rlLimit > 0 {
+		if !l.checkAtomicRateLimit(p) {
 			return nil, false
 		}
 	}
@@ -1461,19 +1469,47 @@ func (l *Logger) syncFlush() {
 // Worker & Lifecycle
 // -----------------------------------------------------------------------------
 
-// Start begins the worker goroutine that processes log entries.
-// It writes to the configured OutputFile or stderr.
-func (l *Logger) Start(ctx context.Context) {
-	var w io.Writer
+// defaultWriter returns the writer Start uses: the log file when OutputFile
+// is configured, stderr otherwise.
+func (l *Logger) defaultWriter() io.Writer {
 	if l.cfg.OutputFile != "" && l.currentWriter != nil {
-		w = l.currentWriter
-	} else {
-		w = os.Stderr
+		return l.currentWriter
 	}
-	l.StartWithWriter(ctx, w)
+	return os.Stderr
 }
 
-// StartWithWriter begins the worker goroutine with a custom io.Writer.
+// Start runs the worker goroutine that processes log entries. It blocks until
+// ctx is cancelled or Close is called, so it is normally started with
+// `go logger.Start(ctx)`. It writes to the configured OutputFile or stderr.
+//
+// `go` returns before the worker goroutine has run, so a Flush() issued right
+// afterwards can still find no running worker. Prefer StartBackground, which
+// returns only once the worker is running.
+func (l *Logger) Start(ctx context.Context) {
+	l.StartWithWriter(ctx, l.defaultWriter())
+}
+
+// StartBackground starts the worker in its own goroutine and returns once the
+// worker is running, so Flush() can be called right away. It writes to the
+// configured OutputFile or stderr. Close stops the worker, so this is enough:
+//
+//	logger.StartBackground(context.Background())
+//	defer logger.Close()
+//
+// Cancelling ctx also stops the worker. In SyncMode it does nothing.
+func (l *Logger) StartBackground(ctx context.Context) {
+	l.StartBackgroundWithWriter(ctx, l.defaultWriter())
+}
+
+// StartBackgroundWithWriter is StartBackground with a custom io.Writer.
+func (l *Logger) StartBackgroundWithWriter(ctx context.Context, w io.Writer) {
+	ready := make(chan struct{})
+	go l.runWorker(ctx, w, ready)
+	<-ready
+}
+
+// StartWithWriter runs the worker goroutine with a custom io.Writer. Like
+// Start it blocks until ctx is cancelled or Close is called.
 //
 // Lifecycle synchronization:
 //   - The started channel is closed (via sync.Once) when the worker begins,
@@ -1484,6 +1520,21 @@ func (l *Logger) Start(ctx context.Context) {
 // The Flush() method drains all pending channel entries before writing,
 // guaranteeing no log loss on explicit flush.
 func (l *Logger) StartWithWriter(ctx context.Context, w io.Writer) {
+	l.runWorker(ctx, w, nil)
+}
+
+// runWorker is the worker. If ready is not nil it is closed as soon as the
+// worker is running, or when there is nothing to start (sync mode, a worker
+// that is already running).
+func (l *Logger) runWorker(ctx context.Context, w io.Writer, ready chan<- struct{}) {
+	var readyOnce sync.Once
+	signalReady := func() {
+		if ready != nil {
+			readyOnce.Do(func() { close(ready) })
+		}
+	}
+	defer signalReady() // covers the early returns
+
 	// Sync mode: no worker needed. Close started/workerDone immediately
 	// and return. This allows code that unconditionally calls Start()
 	// to work correctly in both async and sync modes.
@@ -1494,11 +1545,20 @@ func (l *Logger) StartWithWriter(ctx context.Context, w io.Writer) {
 	}
 
 	// Prevent double-start panics and concurrent starts.
-	// If the worker is already running (or has run and exited), this
-	// call becomes a safe no-op.
+	// If the worker is already running, this call becomes a safe no-op.
+	// The worker gets its own cancel so that Close can stop it.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stopped := make(chan struct{})
+
+	l.workerMu.Lock()
 	if !l.running.CompareAndSwap(false, true) {
+		l.workerMu.Unlock()
 		return
 	}
+	l.workerCancel = cancel
+	l.workerStopped = stopped
+	l.workerMu.Unlock()
 
 	l.globalWriterMu.Lock()
 	l.globalWriter = w
@@ -1513,7 +1573,11 @@ func (l *Logger) StartWithWriter(ctx context.Context, w io.Writer) {
 	defer func() {
 		l.running.Store(false)
 		l.closeOnce.Do(func() { close(l.workerDone) })
+		close(stopped)
 	}()
+
+	// From here on Flush() sees a running worker.
+	signalReady()
 
 	bw, ok := w.(*bufio.Writer)
 	if !ok {
@@ -1537,9 +1601,7 @@ workerLoop:
 
 		// ── Normal log processing ──
 		case e := <-l.logCh:
-			buf = l.formatEntry(buf, e)
-			e.Reset()
-			l.pool.Put(e)
+			buf = l.formatBatch(buf, e)
 			if len(buf) >= flushThreshold {
 				l.writeOut(bw, buf)
 				buf = buf[:0]
@@ -1564,9 +1626,11 @@ workerLoop:
 			for {
 				select {
 				case e := <-l.logCh:
-					buf = l.formatEntry(buf, e)
-					e.Reset()
-					l.pool.Put(e)
+					buf = l.formatBatch(buf, e)
+					if len(buf) >= flushThreshold {
+						l.writeOut(bw, buf)
+						buf = buf[:0]
+					}
 				default:
 					// Channel empty — write and flush the buffer
 					if len(buf) > 0 {
@@ -1606,15 +1670,52 @@ func (l *Logger) writeOut(bw *bufio.Writer, buf []byte) int {
 // Formatting
 // -----------------------------------------------------------------------------
 
-// formatEntry formats a log entry into the buffer. The timestamp is captured
-// here (worker-side) rather than in the hot path, removing a vDSO syscall
-// from the caller's critical path.
+// workerBatchMax bounds how many already-queued entries the worker formats
+// with a single clock read and without going back through its multi-channel
+// select. It also bounds how long ctx cancellation, the flush ticker and
+// Flush() requests can be delayed by a saturating producer.
+const workerBatchMax = 128
+
+// formatEntry formats a log entry into the buffer, stamping it with the
+// current time. Sync mode uses it, so sync entries are stamped at call time.
 func (l *Logger) formatEntry(buf []byte, e *Entry) []byte {
-	ts := time.Now().UnixMilli()
+	return l.formatEntryAt(buf, e, time.Now().UnixMilli())
+}
+
+// formatEntryAt formats a log entry using the given millisecond timestamp.
+func (l *Logger) formatEntryAt(buf []byte, e *Entry, ts int64) []byte {
 	if l.cfg.JSONOutput {
 		return l.formatJSON(buf, e, ts)
 	}
 	return l.formatText(buf, e, ts)
+}
+
+// formatBatch formats first and then, without blocking, up to
+// workerBatchMax-1 entries that are already queued, reading the clock once
+// for the whole batch. It stops early when buf reaches FlushThreshold so the
+// caller can write the buffer out; entries not taken stay in the channel.
+//
+// Timestamps have millisecond resolution and a batch is formatted within
+// microseconds, so a shared stamp changes little in practice, but the
+// entries of one batch do carry the same ts. Every entry is recycled to the
+// pool here.
+func (l *Logger) formatBatch(buf []byte, first *Entry) []byte {
+	ts := time.Now().UnixMilli()
+	buf = l.formatEntryAt(buf, first, ts)
+	first.Reset()
+	l.pool.Put(first)
+
+	for n := 1; n < workerBatchMax && len(buf) < l.cfg.FlushThreshold; n++ {
+		select {
+		case e := <-l.logCh:
+			buf = l.formatEntryAt(buf, e, ts)
+			e.Reset()
+			l.pool.Put(e)
+		default:
+			return buf
+		}
+	}
+	return buf
 }
 
 // formatText formats a log entry as human-readable text:
@@ -2183,9 +2284,11 @@ func (l *Logger) drainAndFlush(bw *bufio.Writer, buf []byte) {
 	for {
 		select {
 		case e := <-l.logCh:
-			buf = l.formatEntry(buf, e)
-			e.Reset()
-			l.pool.Put(e)
+			buf = l.formatBatch(buf, e)
+			if len(buf) >= l.cfg.FlushThreshold {
+				l.writeOut(bw, buf)
+				buf = buf[:0]
+			}
 		default:
 			if len(buf) > 0 {
 				l.writeOut(bw, buf)
@@ -2200,14 +2303,12 @@ func (l *Logger) drainAndFlush(bw *bufio.Writer, buf []byte) {
 // the worker to drain the channel and write the buffer, then blocks until
 // the worker confirms completion (or times out after 1 second).
 //
-// If no worker is running, Flush drains and discards all pending entries
-// to prevent channel blockage. This also fixes the 1-second block that
-// occurred when OutputFile was set but Start() hadn't been called yet.
-// The discarded entries are not counted in Drops(). Note that
+// If no worker is running, Flush returns immediately and the pending entries
+// stay queued: they are written when a worker starts, or counted in Drops()
+// if the channel fills up first. (Before v1.5.0 they were discarded.)
 // `go logger.Start(ctx)` returns before the worker goroutine has run, so a
-// Flush() issued immediately afterwards can still observe "no worker" and
-// discard entries; the public API offers no way to wait for worker start in
-// v1.4.x.
+// Flush() issued right afterwards finds no worker and does not wait; use
+// StartBackground, which returns once the worker is running.
 //
 // In SyncMode, Flush flushes the shared buffer of the OSBuffered and
 // FsyncEveryN tiers (and fsyncs for FsyncEveryN); it does nothing for Direct
@@ -2223,20 +2324,10 @@ func (l *Logger) Flush() {
 	l.flushMu.Lock()
 	defer l.flushMu.Unlock()
 
-	// If the worker is not running, drain the channel and discard entries.
-	// This is critical for OutputFile configurations where globalWriter
-	// is set during NewLogger, which previously caused Flush() to block
-	// for 1 second waiting for a non-existent worker.
+	// No worker: do not wait for one (that would block for the full timeout)
+	// and do not discard the queued entries.
 	if !l.running.Load() {
-		for {
-			select {
-			case e := <-l.logCh:
-				e.Reset()
-				l.pool.Put(e)
-			default:
-				return
-			}
-		}
+		return
 	}
 
 	done := make(chan struct{})
@@ -2255,13 +2346,45 @@ func (l *Logger) Flush() {
 	}
 }
 
-// Close releases resources held by the logger.
-// In async mode: flushes the buffered writer and closes the log file. It does
-// NOT stop the worker; call Flush(), then cancel the context passed to Start,
-// then Close (see the Quick Start).
-// In sync mode: flushes the shared buffered writer (and fsyncs for
+// closeWaitTimeout is how long Close waits for the worker to drain the
+// channel and exit before it closes the file anyway.
+const closeWaitTimeout = 5 * time.Second
+
+// stopWorker asks the worker, if one was started, to stop and waits until it
+// has drained the channel and exited. It returns at once when no worker was
+// started or the worker has already exited.
+func (l *Logger) stopWorker() {
+	l.workerMu.Lock()
+	cancel, stopped := l.workerCancel, l.workerStopped
+	l.workerMu.Unlock()
+	if cancel == nil {
+		return
+	}
+
+	cancel()
+
+	timer := time.NewTimer(closeWaitTimeout)
+	defer timer.Stop()
+	select {
+	case <-stopped:
+	case <-timer.C:
+		fmt.Fprintf(os.Stderr, "loggerj: worker did not stop within %v; closing anyway\n", closeWaitTimeout)
+	}
+}
+
+// Close stops the worker, if one is running, waits for it to drain the channel
+// and exit, and then flushes and closes the log file. Cancelling the context
+// given to Start first is fine. Close is safe to call more than once; later
+// calls return nil. If the worker does not exit within a few seconds (for
+// example because a custom writer blocks), Close stops waiting and closes the
+// file anyway.
+//
+// In sync mode Close flushes the shared buffered writer (and fsyncs for
 // FsyncEveryN) and closes the sync file.
 func (l *Logger) Close() error {
+	if !l.closed.CompareAndSwap(false, true) {
+		return nil
+	}
 	if l.cfg.SyncMode {
 		// Final flush for OSBuffered and FsyncEveryN (fsync for the latter),
 		// so no buffered entry is left in process memory.
@@ -2271,6 +2394,9 @@ func (l *Logger) Close() error {
 		}
 		return nil
 	}
+
+	l.stopWorker()
+
 	l.rotationMu.Lock()
 	defer l.rotationMu.Unlock()
 	if l.currentWriter != nil {
@@ -2426,20 +2552,19 @@ var rateLimitFallbackEpochMs = time.Now().UnixMilli()
 // The window is a fixed window that starts when the profile is registered,
 // so up to 2*limit entries can pass around a window boundary.
 //
-// GATE ORDER (v1.4.x): rate limiting is applied BEFORE sampling. The limit
-// counts entries that passed the level filter, before sampling discards any.
-// With both WithRateLimit(100, time.Second) and WithSampleRate(10):
+// GATE ORDER (v1.5.0+): rate limiting is applied AFTER sampling, so the limit
+// caps what is actually written. With both WithRateLimit(100, time.Second)
+// and WithSampleRate(10):
 //
 //  1. Input: 500 logs/s
-//  2. Rate limit: at most 100 logs per second are admitted
-//  3. Sampling: 1 out of 10 admitted logs is written
-//     Result: ~10 logs/s are written (not 100).
+//  2. Sampling: 1 out of 10 is kept, 50 logs/s
+//  3. Rate limit: at most 100 logs per second are admitted
+//     Result: min(500/10, 100) = 50 logs/s are written.
 //
-// So the rate limit is NOT a cap on the output when sampling is also set.
-// Because the rate limiter runs first, every call pays for one clock read
-// (~34ns) even if sampling would have discarded the entry. v1.5.0 is planned
-// to switch to sampling first (see ROADMAP.md); the example above would then
-// yield min(500/10, 100) = 50 logs/s.
+// Entries discarded by sampling do not use up the rate limit, and they do not
+// pay for the rate limiter's clock read (~34ns). Before v1.5.0 the rate
+// limiter ran first: the limit counted entries before sampling and the
+// example above wrote ~10 logs/s.
 //
 // Exact counting supports limits up to rlMaxExactLimit (16,777,215).
 // Larger limits are capped to that value.

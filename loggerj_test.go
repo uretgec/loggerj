@@ -2439,31 +2439,26 @@ func BenchmarkCheckAtomicRateLimit_Saturated(b *testing.B) {
 	})
 }
 
-// TestLog_RateLimitAndSampling_Order verifies the fixed gate order:
-// Rate Limit (admission control) runs BEFORE Sampling (cost reduction).
+// TestLog_RateLimitAndSampling_Order verifies the gate order since v1.5.0:
+// Sampling runs BEFORE the rate limit, so the limit caps the written output.
 //
-// Setup: 100 raw logs, RateLimit=10/s, SampleRate=2 (1 out of 2).
+// Setup: 100 raw logs, SampleRate=2 (1 out of 2), RateLimit=10/s.
 //
-// Expected behavior (new, correct order):
-//  1. Rate limit admits 10 logs out of 100 raw input.
-//  2. Sampling accepts 1/2 of the admitted 10 logs = 5 logs written.
+//  1. Sampling keeps 50 of the 100 raw logs.
+//  2. The rate limit admits 10 of those 50, so 10 logs are written.
 //
-// Old (incorrect) behavior would have been:
-//  1. Sampling accepts 1/2 of 100 raw = 50 logs.
-//  2. Rate limit admits 10 out of 50 sampled = 10 logs written.
+// Before v1.5.0 (rate limit first) the result was ~5.
 func TestLog_RateLimitAndSampling_Order(t *testing.T) {
 	logger, buf, _ := setupTestLogger(t, Config{
 		FlushTimeout: 10 * time.Millisecond,
 		ChannelSize:  1000,
 	})
 
-	// Register with BOTH rate limit and sampling
 	logger.RegisterSub("GATES",
-		WithRateLimit(10, time.Second), // Admit max 10 per second
-		WithSampleRate(2),              // Then sample 1 out of 2 admitted
+		WithSampleRate(2),              // keep 1 out of 2
+		WithRateLimit(10, time.Second), // then admit at most 10 per second
 	)
 
-	// Burst 100 raw logs in a single window (<1s)
 	for i := 0; i < 100; i++ {
 		logger.Log(LevelInfo, "GATES", []byte("raw input"))
 	}
@@ -2471,15 +2466,39 @@ func TestLog_RateLimitAndSampling_Order(t *testing.T) {
 	output := flushAndRead(t, logger, buf)
 	count := strings.Count(output, "raw input")
 
-	// With rate-limit FIRST: 100 raw -> 10 admitted -> 5 sampled.
-	// Tolerance: 4-6 (allow small jitter for atomic ordering).
-	if count < 4 || count > 6 {
-		t.Errorf("expected ~5 logs (rate-limit then sample), got %d. Gate order may be wrong.", count)
+	// Tolerance: a window boundary inside the test could admit a few more.
+	if count < 10 || count > 12 {
+		t.Errorf("expected ~10 logs (sample then rate-limit), got %d. Gate order may be wrong.", count)
+	}
+	if count <= 6 {
+		t.Errorf("observed ~5 logs: the rate limit ran BEFORE sampling (pre-v1.5.0 order)")
+	}
+}
+
+// TestLog_SamplingDoesNotConsumeRateLimit verifies that entries discarded by
+// sampling do not use up the rate limit: the documented example
+// min(500/10, 100) = 50.
+func TestLog_SamplingDoesNotConsumeRateLimit(t *testing.T) {
+	logger, buf, _ := setupTestLogger(t, Config{
+		FlushTimeout: 10 * time.Millisecond,
+		ChannelSize:  1000,
+	})
+
+	logger.RegisterSub("GATES2",
+		WithSampleRate(10),
+		WithRateLimit(100, time.Second),
+	)
+
+	for i := 0; i < 500; i++ {
+		logger.Log(LevelInfo, "GATES2", []byte("sampled input"))
 	}
 
-	// Explicitly fail if old behavior (10 logs) is observed
-	if count >= 9 {
-		t.Errorf("observed ~10 logs: sampling ran BEFORE rate limit. Gate order is wrong!")
+	output := flushAndRead(t, logger, buf)
+	count := strings.Count(output, "sampled input")
+
+	// 500 raw -> 50 sampled -> all 50 are below the limit of 100.
+	if count != 50 {
+		t.Errorf("expected exactly 50 logs, got %d", count)
 	}
 }
 

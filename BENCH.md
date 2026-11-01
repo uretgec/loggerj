@@ -2,7 +2,7 @@
 
 Detailed performance analysis for `loggerj`.
 
-**The tables below are the v1.4.4 measurements and were NOT re-run for v1.4.4.** v1.4.4 changed the code paths of the slog adapter, JSON string escaping, durations and the rate limiter; re-run the benchmarks on your hardware before relying on a number.
+**The tables below are the v1.4.3 measurements and were NOT re-run for v1.4.4.** v1.4.4 changed the code paths of the slog adapter, JSON string escaping, durations and the rate limiter; re-run the benchmarks on your hardware before relying on a number.
 
 **Environment:** Apple M1 Pro (10 cores), Go 1.24, `-count=6`, `-race` disabled.
 *Note: Benchmark numbers vary ±10% across runs due to thermal throttling and CPU frequency scaling. Treat the order of magnitude as meaningful. Always benchmark on your own hardware.*
@@ -38,6 +38,29 @@ The async benchmarks (`BenchmarkLog_*`) measure the **caller-side cost of one lo
 | `BenchmarkE2E_TypedFields_JSON` | 79.2 | 0.78 | ~2.8M |
 
   In these tight-loop benchmarks about 80% of the attempts are dropped: the single worker delivers roughly 3M entries/s while the producer attempts ~18M/s. The ns/op figures in the async table below are therefore mostly the cost of the drop path, and the delivered rate with a saturating producer is ~3M entries/s. Real services rarely log at a saturating rate, so measure with your own load.
+
+## v1.5.0 development: measured changes
+
+Apple M1 Pro, darwin/arm64, `benchstat` with `-count=6`, base = v1.4.4.
+
+| Benchmark | Metric | v1.4.4 | v1.5.0 dev |
+|---|---|---:|---:|
+| `E2E_NoFields_Text` | delivered/s | 3.52M | 5.28M (+50%) |
+| `E2E_NoFields_Text` | drops/op | 0.80 | 0.18 |
+| `E2E_TypedFields_JSON` | delivered/s | 2.50M | 3.61M (+44%) |
+| `E2E_TypedFields_JSON` | drops/op | 0.79 | 0.64 |
+
+The worker now formats queued entries in batches (one `select` and one clock read per batch). The ns/op of the `BenchmarkLog_*` benchmarks rises with it because fewer attempts take the cheap drop path (`drops/op` falls); that is a change in the mix, not in the cost of a call.
+
+`BenchmarkLog_Enqueue_*` measures the caller-side cost of a call that is really enqueued, with no drops and no worker running (a lower bound: no producer/worker contention on the channel lock, warm entry pool). Unchanged between v1.4.4 and the batch-drain change:
+
+| Benchmark | ns/op |
+|---|---:|
+| `Log_Enqueue_NoFields` | ~28.5 |
+| `Log_Enqueue_StringAPI` | ~30 |
+| `Log_Enqueue_TypedFields` | ~47.5 |
+
+These are the benchmarks protected by `hotpath.txt` (together with `Log_Filtered` and `Log_RateLimited`).
 
 ## 1. Async Mode (Intended Usage)
 

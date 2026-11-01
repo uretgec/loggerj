@@ -14,7 +14,7 @@ High-performance, zero-allocation asynchronous logging for Go.
 
 - **Asynchronous Pipeline**: Non-blocking channel + dedicated worker goroutine.
 - **Zero-Allocation Typed Fields**: `Int()`, `Bool()`, `Dur()` without interface boxing.
-- **Lock-Free Rate Limiting & Sampling**: `atomic.CompareAndSwap` (CAS) with bounded backoff for rate limiting, an atomic counter for sampling. Both run before the sync/async split, so they apply in both modes. In v1.4.x the rate limit runs before sampling (see `WithRateLimit`).
+- **Lock-Free Rate Limiting & Sampling**: `atomic.CompareAndSwap` (CAS) with bounded backoff for rate limiting, an atomic counter for sampling. Both run before the sync/async split, so they apply in both modes. Since v1.5.0 sampling runs before the rate limit (see `WithRateLimit`).
 - **Pre-baked SubProfiles**: Static fields formatted once at init, injected via `memcpy` at log time.
 - **Sync Mode with Durability Tiers**: 4 explicit tiers. Only `Direct` and `FsyncEveryWrite` survive a process crash for every entry; `OSBuffered` and `FsyncEveryN` keep entries in a process-memory buffer (see the table below). `Direct` and `FsyncEveryWrite` take no loggerj mutex; `OSBuffered` and `FsyncEveryN` hold a mutex around the shared `bufio.Writer` during buffer copy AND flush/fsync.
 - **Native log rotation** — size-based with backup retention, zero external dependencies, async mode only (ignored in Sync Mode). No time-based rotation, no compression. For daily rotation or gzip, use lumberjack via `StartWithWriter()`.
@@ -46,13 +46,8 @@ func main() {
     )
 
     // 3. Start the async worker
-    ctx, cancel := context.WithCancel(context.Background())
-    go logger.Start(ctx)
-    defer func() {
-        logger.Flush() // drain the channel while the worker is still running
-        cancel()       // stop the worker
-        logger.Close() // close the file
-    }()
+    logger.StartBackground(context.Background())
+    defer logger.Close() // drains queued entries, stops the worker, closes the file
 
     // 4. Log messages (HOT PATH: zero allocation)
     logger.InfoString("HTTP", "request received", "method", "GET", "path", "/api")

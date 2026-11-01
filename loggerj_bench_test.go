@@ -1004,6 +1004,11 @@ func benchmarkE2E(b *testing.B, cfg Config, logFn func(l *Logger)) {
 	if elapsed > 0 {
 		b.ReportMetric(float64(delivered)/elapsed.Seconds(), "delivered/s")
 	}
+	// ns/op divides by ALL attempts, including cheap drops, so it rises when
+	// fewer attempts are dropped. Compare ns/delivered or delivered/s instead.
+	if delivered > 0 {
+		b.ReportMetric(float64(elapsed.Nanoseconds())/float64(delivered), "ns/delivered")
+	}
 }
 
 func BenchmarkE2E_NoFields_Text(b *testing.B) {
@@ -1048,4 +1053,82 @@ func BenchmarkSyncMode_FsyncEveryN(b *testing.B) {
 	}
 	b.StopTimer()
 	logger.Close()
+}
+
+// -----------------------------------------------------------------------------
+// Enqueue-only benchmarks (regression gates for the caller-side cost)
+// -----------------------------------------------------------------------------
+
+// benchmarkEnqueue measures the caller-side cost of a log call that is really
+// enqueued. No worker runs during the timed region, the channel is large
+// enough that nothing is dropped, and the queue is emptied between chunks
+// outside the timer.
+//
+// It is a lower bound for async callers: there is no producer/worker
+// contention on the channel lock and the entry pool stays warm. Use it for
+// regression gates, because the ns/op of the BenchmarkLog_* family depends on
+// how many attempts the worker lets through (drops/op); use BenchmarkE2E_*
+// for delivered throughput.
+func benchmarkEnqueue(b *testing.B, cfg Config, logFn func(l *Logger)) {
+	const chunk = 1 << 16
+	cfg.ChannelSize = chunk
+	logger := NewLogger(cfg)
+
+	drain := func() {
+		for len(logger.logCh) > 0 {
+			e := <-logger.logCh
+			e.Reset()
+			logger.pool.Put(e)
+		}
+	}
+
+	// Warm the entry pool so pool misses are not part of the measurement.
+	for i := 0; i < chunk; i++ {
+		logFn(logger)
+	}
+	drain()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for done := 0; done < b.N; {
+		n := b.N - done
+		if n > chunk {
+			n = chunk
+		}
+		for i := 0; i < n; i++ {
+			logFn(logger)
+		}
+		done += n
+
+		b.StopTimer()
+		drain()
+		b.StartTimer()
+	}
+	if d := logger.Drops(); d != 0 {
+		b.Fatalf("enqueue benchmark dropped %d entries", d)
+	}
+}
+
+func BenchmarkLog_Enqueue_NoFields(b *testing.B) {
+	benchmarkEnqueue(b, Config{}, func(l *Logger) {
+		l.Log(LevelInfo, "TEST", []byte("message"))
+	})
+}
+
+func BenchmarkLog_Enqueue_StringAPI(b *testing.B) {
+	benchmarkEnqueue(b, Config{}, func(l *Logger) {
+		l.InfoString("TEST", "message", "key1", "value1")
+	})
+}
+
+func BenchmarkLog_Enqueue_TypedFields(b *testing.B) {
+	status, latency := 200, 50*time.Millisecond
+	benchmarkEnqueue(b, Config{JSONOutput: true}, func(l *Logger) {
+		l.InfoFields("HTTP", []byte("request"),
+			Int("status", status),
+			Dur("latency", latency),
+			Bool("cached", true),
+			Str("method", "GET"),
+		)
+	})
 }

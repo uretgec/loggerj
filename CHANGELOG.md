@@ -6,6 +6,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased] - v1.5.0 development
+
+### Added
+
+- `StartBackground(ctx)` and `StartBackgroundWithWriter(ctx, w)`: start the worker in its own goroutine and return once it is running, so `Flush()` can be called right away. `Start` / `StartWithWriter` are unchanged (blocking, started with `go`).
+
+### Performance
+
+- **Worker batch drain:** the worker formats up to 128 already-queued entries per pass instead of going through its four-channel `select` for every entry, and reads the clock once per batch instead of once per entry. Measured on the v1.4.4 profile (Apple M1 Pro, saturating producer): `select` was ~57% and `time.Now` ~23% of the worker's time, formatting ~3%. Measured with `benchstat` (Apple M1 Pro, `-count=6`, p=0.002): `BenchmarkE2E_NoFields_Text` delivered/s 3.52M -> 5.28M (+50%), `drops/op` 0.80 -> 0.18; `BenchmarkE2E_TypedFields_JSON` delivered/s 2.50M -> 3.61M (+44%), `drops/op` 0.79 -> 0.64. Sync-mode benchmarks are unchanged. The `ns/op` of the async `BenchmarkLog_*` benchmarks rises because fewer attempts take the cheap drop path; see "Benchmarks" below.
+
+### Benchmarks
+
+- Added `BenchmarkLog_Enqueue_*`: caller-side cost of a log call that is really enqueued (no drops, no worker contention). These replace the drop-mixed `BenchmarkLog_*` benchmarks in `hotpath.txt`, whose `ns/op` changes with the drop ratio and therefore with the worker's speed. `BenchmarkE2E_*` now also reports `ns/delivered`.
+
+### Behavior changes
+
+- **`Close()` stops the worker.** It cancels the worker, waits (up to 5 seconds) for it to drain the channel and exit, then flushes and closes the file. `logger.StartBackground(ctx)` + `defer logger.Close()` is now a complete lifecycle; the previous `Flush(); cancel(); Close()` order still works. `Close()` is idempotent (later calls return nil).
+- **`Flush()` without a running worker no longer discards the queued entries.** It returns immediately and the entries are written when a worker starts (or counted in `Drops()` if the channel fills up first). Before, `go logger.Start(ctx); logger.Flush()` could silently discard them.
+- **Gate order:** sampling now runs before the rate limit (it was the other way round in v1.4.x). `WithRateLimit` therefore caps what is written, entries discarded by sampling no longer use up the limit, and they no longer pay for the rate limiter's clock read. With `WithRateLimit(100, time.Second)` + `WithSampleRate(10)` and 500 attempts/s the output changes from ~10 to 50 logs/s. To keep the old output volume, use `WithRateLimit(limit/sampleRate, window)`.
+- Entries formatted in the same batch carry the same `ts` (millisecond resolution; a batch is formatted within microseconds). Sync mode still stamps at call time.
+- `Flush()` now writes at `FlushThreshold` while draining instead of accumulating the whole channel in the buffer first. Rotation is still only checked by the worker's threshold and ticker writes, not by `Flush()`.
+
+---
+
 ## [1.4.4] - 2026-10-26
 
 Patch release: bug fixes and documentation corrections. The gate order (rate limit before sampling) is unchanged; switching to sampling first is planned for v1.5.0.

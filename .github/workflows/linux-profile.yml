@@ -1,0 +1,85 @@
+name: linux-profile
+
+# Manual run: Linux benchmarks and CPU/mutex profiles on a GitHub-hosted runner.
+# Actions tab -> "linux-profile" -> "Run workflow".
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "What to run"
+        type: choice
+        options: [all, bench, profile]
+        default: all
+      count:
+        description: "Benchmark repetitions (-count)"
+        default: "10"
+      benchtime:
+        description: "Run time of each profiled benchmark"
+        default: "5s"
+      compare_ref:
+        description: "Optional tag/branch/sha to compare against with benchstat (runs on the same machine), e.g. v1.4.4"
+        default: "v1.4.4"
+
+permissions:
+  contents: read
+
+jobs:
+  linux-profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      OUT_DIR: profiles/linux
+      MODE: ${{ inputs.mode }}
+      COUNT: ${{ inputs.count }}
+      BENCHTIME: ${{ inputs.benchtime }}
+      COMPARE_REF: ${{ inputs.compare_ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # needed to check out compare_ref
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24" # the version used for the numbers in BENCH.md
+
+      - name: Benchmarks and profiles
+        run: SRC_DIR="$GITHUB_WORKSPACE" bash profile-inner.sh "$MODE"
+
+      - name: Compare with ${{ inputs.compare_ref }} (benchstat)
+        if: ${{ inputs.compare_ref != '' }}
+        run: |
+          set -euo pipefail
+          go install golang.org/x/perf/cmd/benchstat@latest
+
+          # Only benchmarks that exist in both versions.
+          PAT='E2E_|Log_Filtered$|Log_RateLimited$|TimeNowUnixMilli'
+
+          git worktree add ../loggerj-base "$COMPARE_REF"
+          (cd ../loggerj-base && go test -run '^$' -bench "$PAT" -benchmem -count="$COUNT" . | tee "$GITHUB_WORKSPACE/$OUT_DIR/compare_base.txt")
+          go test -run '^$' -bench "$PAT" -benchmem -count="$COUNT" . | tee "$OUT_DIR/compare_new.txt"
+
+          "$(go env GOPATH)/bin/benchstat" "$OUT_DIR/compare_base.txt" "$OUT_DIR/compare_new.txt" | tee "$OUT_DIR/compare_benchstat.txt"
+
+      - name: Job summary
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          show() { # title file [max lines]
+            if [ -f "$2" ]; then
+              { echo "### $1"; echo '```'; head -n "${3:-60}" "$2"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+          show "Environment" "$OUT_DIR/env.txt"
+          show "Benchmarks" "$OUT_DIR/bench.txt" 80
+          show "benchstat vs $COMPARE_REF" "$OUT_DIR/compare_benchstat.txt" 80
+          show "Worker CPU: E2E_NoFields_Text" "$OUT_DIR/cpu_e2e_nofields_worker.txt" 35
+          show "Producer CPU: E2E_NoFields_Text" "$OUT_DIR/cpu_e2e_nofields_producer.txt" 35
+          show "Worker CPU: E2E_TypedFields_JSON" "$OUT_DIR/cpu_e2e_typed_json_worker.txt" 35
+          show "Mutex: E2E_NoFields_Text" "$OUT_DIR/mutex_e2e_nofields_top.txt" 25
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: linux-profile-${{ github.run_number }}
+          path: profiles/linux/
+          retention-days: 30

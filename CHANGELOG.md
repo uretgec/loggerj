@@ -13,8 +13,8 @@ Performance patch: no API, behavior or output changes. Based on the first Linux 
 ### Performance
 
 - **Timestamp rendered once per batch.** The worker used to format the timestamp digits for every entry; in the Linux profile `appendTimestamp` was ~15% of the worker's time for text output and ~9% for JSON. The digits are now rendered once per batch and copied. Sync mode still stamps each entry when it is logged.
-- **Lookup tables in the string escapers.** The JSON string escaper (`appendJSONStringBytes`, ~26% of the worker's time for JSON output in the profile) and the text escaper test each byte with a table lookup instead of several comparisons. The output is identical (`FuzzAppendJSONString`, `TestAppendTextBytes_Table`, and new table tests).
-- The gain has not been measured yet: compare `BenchmarkE2E_*` (delivered/s) and the new `BenchmarkAppendJSONString` / `BenchmarkAppendTextString` with v1.5.0, for example with the `linux-profile` workflow (`compare_ref: v1.5.0`).
+- **Lookup tables in the string escapers.** The JSON string escaper (`appendJSONStringBytes`, ~26% of the worker's time for JSON output in the profile) and the text escaper test each byte with a table lookup instead of several comparisons. The output is identical (`FuzzAppendJSONString`, `TestAppendTextBytes_Table`, and new table tests). **No measurable effect:** in the v1.5.1 profile `appendJSONStringBytes` is still ~27-30% of the JSON worker's time. The strings are short (keys and values of a few bytes), so the cost is per call, not per byte.
+- Measured on the Linux runner against v1.5.0 (`benchstat`, `-count=10`): `E2E_NoFields_Text` delivered/s 4.40M -> 4.78M (+8.6%, p=0.002), `E2E_TypedFields_JSON` 2.77M -> 3.13M (+12.9%, p<0.001); per delivered entry 227 -> 209 ns and 361 -> 320 ns. The gain comes from the timestamp change; the tables did not add a measurable share.
 
 ### Repository
 

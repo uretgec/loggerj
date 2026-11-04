@@ -58,7 +58,8 @@ Theme: **Throughput, lifecycle and cleanup.** See CHANGELOG.md.
 ### Measure first
 
 - [x] Profile the async path on Linux (v1.5.0, 4 vCPU runner). The worker spends ~48% of its time in `chanrecv` and ~15% in `sync.Pool.Put`, formatting ~31%; the producer ~54% in `chansend` and ~20% in `sync.Pool.Get`; the mutex profile is entirely the runtime's channel lock. This is the case for the ring buffer below.
-- [ ] Profile `Log_Enqueue_Slog` (138 ns on the Linux runner, 80 ns on the M1): where does the time go (attribute conversion, pool, `ctx.Value`)?
+- [x] Profile `Log_Enqueue_Slog` (138 ns on the Linux runner): the context lookups are ~3%; most of the time is the slog API itself (record copy, attribute conversion) and the queue handoff. No action.
+- [x] Re-profile after v1.5.1: the worker still spends over 60% of its time in queue operations (`chanrecv`, `sync.Pool.Put`) and ~31% formatting. For JSON output, `appendJSONStringBytes` is ~29% of the worker, but it is dominated by per-call overhead on short strings, not by bytes scanned (the lookup tables of v1.5.1 did not change its share). Pre-baking `"type":"..."` per profile would remove one call per entry.
 - [ ] Defer caller resolution to the worker: store the PC and resolve it with `runtime.CallersFrames`. Verify how `runtime.Callers` with a one-element buffer behaves for inlined frames across Go 1.21-1.24 before shipping.
 - [ ] Bounded MPSC ring buffer of pre-allocated entries instead of channel + `sync.Pool` (the v1.4.4 profile showed channel lock and pool contention).
 - [ ] Rotation check on the `Flush()` path.

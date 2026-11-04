@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue?style=for-the-badge" alt="License: MIT">
   <img src="https://img.shields.io/badge/Go-1.21+-00ADD8?style=for-the-badge&logo=go" alt="Go Version">
-  <img src="https://img.shields.io/badge/version-v1.5.0-green?style=for-the-badge" alt="Version: 1.5.0">
+  <img src="https://img.shields.io/badge/version-v1.5.1-green?style=for-the-badge" alt="Version: 1.5.1">
 </p>
 
 # loggerj

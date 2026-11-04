@@ -72,8 +72,29 @@ Other v1.5.0 measurements (same machine, `-count=6`):
 | `Log_Enqueue_NoFields` | 28.3 ns | 28.2 ns |
 | `Log_Enqueue_StringAPI` | 30.6 ns | 29.7 ns |
 | `Log_Enqueue_TypedFields` | 47.9 ns | 47.5 ns |
+| `Log_Enqueue_Slog` (adapter `Handle`, 2 attributes) | not measured | 80.5 ns, 0 allocs |
 
 `Log_Enqueue_Sub` (a `SubLogger` handle) measured 31.2 ns against 29.7 ns for the same call through `InfoString("TEST", ...)` in the same build, so with a small registry the handle is not faster: the profile lookup it skips is a short linear scan, and the handle adds one more call. Use `SubLogger` for safety (a typo cannot lose the profile), not for speed.
+
+## v1.5.0 on Linux amd64 (GitHub Actions)
+
+GitHub-hosted `ubuntu-latest` runner (Azure VM, AMD EPYC 7763, 4 vCPU, Linux 7.0-azure, Go 1.24.13), `-count=10`. The v1.4.4 and v1.5.0 numbers below come from the same job on the same machine (`linux-profile` workflow, `compare_ref: v1.4.4`), compared with `benchstat`. The runner is a shared VM, so trust the ratios more than the absolute values.
+
+| Benchmark | v1.4.4 | v1.5.0 | Change |
+|---|---:|---:|---:|
+| `Log_Filtered` | 2.82 ns | 2.50 ns | -11% |
+| `Log_RateLimited` | 64.6 ns | 41.0 ns | -37% |
+| `TimeNowUnixMilli` (reference, unchanged code) | 56.8 ns | 56.8 ns | ~ |
+| `E2E_NoFields_Text` delivered/s | 2.52M | 4.34M | +72% |
+| `E2E_TypedFields_JSON` delivered/s | 1.72M | 2.82M | +64% |
+| `E2E_NoFields_Text` drops/op | 0.43 (+-71%) | 0.34 | -20% |
+| `E2E_TypedFields_JSON` drops/op | 0.80 | 0.52 | -35% |
+
+The `sec/op` column of `benchstat` for the E2E benchmarks is not meaningful here (it divides by all attempts, including cheap drops), which is why it shows +46% for `E2E_TypedFields_JSON` while delivered/s grows by 64%. v1.5.0 delivers an entry in about 230 ns (`NoFields`) and 354 ns (`TypedFields_JSON`); v1.4.4 needed about 400 ns and 580 ns (1 / delivered/s). The v1.4.4 `E2E_NoFields_Text` runs were bimodal (two of ten runs dropped 75% of the attempts), hence the wide interval.
+
+Clock read on this VM: `time.Now().UnixMilli()` 56.8 ns, `monoMillis()` 30.3 ns (-47%), so the rate limiter's monotonic clock helps here as much as on the Apple M1 Pro. Clock reads are noticeably slower on this VM than on the M1, which is why `Log_RateLimited` is dominated by the clock read.
+
+Drop-free enqueue cost on the same runner (v1.4.4 has no such benchmarks): `Log_Enqueue_NoFields` 46.1 ns, `Log_Enqueue_StringAPI` 49.5 ns, `Log_Enqueue_TypedFields` 67-73 ns (noisy), `Log_Enqueue_Sub` 50.5 ns, `Log_Enqueue_Slog` 138 ns. As on the M1, the `SubLogger` handle is not faster than `InfoString` with a log type.
 
 ## 1. Async Mode (Intended Usage)
 

@@ -20,11 +20,13 @@ const workerBatchMax = 128
 // formatEntry formats a log entry into the buffer, stamping it with the
 // current time. Sync mode uses it, so sync entries are stamped at call time.
 func (l *Logger) formatEntry(buf []byte, e *Entry) []byte {
-	return l.formatEntryAt(buf, e, time.Now().UnixMilli())
+	var tb [48]byte
+	return l.formatEntryAt(buf, e, l.renderTimestamp(tb[:0], time.Now().UnixMilli()))
 }
 
-// formatEntryAt formats a log entry using the given millisecond timestamp.
-func (l *Logger) formatEntryAt(buf []byte, e *Entry, ts int64) []byte {
+// formatEntryAt formats a log entry using an already rendered timestamp (see
+// renderTimestamp), so a batch renders the timestamp once.
+func (l *Logger) formatEntryAt(buf []byte, e *Entry, ts []byte) []byte {
 	if l.cfg.JSONOutput {
 		return l.formatJSON(buf, e, ts)
 	}
@@ -41,7 +43,8 @@ func (l *Logger) formatEntryAt(buf []byte, e *Entry, ts int64) []byte {
 // entries of one batch do carry the same ts. Every entry is recycled to the
 // pool here.
 func (l *Logger) formatBatch(buf []byte, first *Entry) []byte {
-	ts := time.Now().UnixMilli()
+	var tb [48]byte
+	ts := l.renderTimestamp(tb[:0], time.Now().UnixMilli())
 	buf = l.formatEntryAt(buf, first, ts)
 	first.Reset()
 	l.pool.Put(first)
@@ -59,28 +62,22 @@ func (l *Logger) formatBatch(buf []byte, first *Entry) []byte {
 	return buf
 }
 
-// appendTimestamp appends the entry timestamp: Unix milliseconds by default,
-// or the UTC time in Config.TimestampFormat (quoted when quote is true).
-func (l *Logger) appendTimestamp(buf []byte, ts int64, quote bool) []byte {
+// renderTimestamp appends the text of the entry timestamp for ts (Unix
+// milliseconds): the number by default, or the UTC time in
+// Config.TimestampFormat. JSON output adds the quotes around a formatted time.
+func (l *Logger) renderTimestamp(dst []byte, ts int64) []byte {
 	if l.cfg.TimestampFormat == "" {
-		return strconv.AppendInt(buf, ts, 10)
+		return strconv.AppendInt(dst, ts, 10)
 	}
-	if quote {
-		buf = append(buf, '"')
-	}
-	buf = time.UnixMilli(ts).UTC().AppendFormat(buf, l.cfg.TimestampFormat)
-	if quote {
-		buf = append(buf, '"')
-	}
-	return buf
+	return time.UnixMilli(ts).UTC().AppendFormat(dst, l.cfg.TimestampFormat)
 }
 
 // formatText formats a log entry as human-readable text:
 //
 //	[1704067200123] INFO [HTTP] request received method=GET path=/api
-func (l *Logger) formatText(buf []byte, e *Entry, ts int64) []byte {
+func (l *Logger) formatText(buf []byte, e *Entry, ts []byte) []byte {
 	buf = append(buf, '[')
-	buf = l.appendTimestamp(buf, ts, false)
+	buf = append(buf, ts...)
 	buf = append(buf, "] "...)
 	buf = append(buf, e.Level.String()...)
 	buf = append(buf, " ["...)
@@ -122,9 +119,15 @@ func (l *Logger) formatText(buf []byte, e *Entry, ts int64) []byte {
 // formatJSON formats a log entry as a single-line JSON object:
 //
 //	{"ts":1704067200123,"level":"INFO","type":"HTTP","msg":"request received","fields":{"method":"GET"}}
-func (l *Logger) formatJSON(buf []byte, e *Entry, ts int64) []byte {
+func (l *Logger) formatJSON(buf []byte, e *Entry, ts []byte) []byte {
 	buf = append(buf, `{"ts":`...)
-	buf = l.appendTimestamp(buf, ts, true)
+	if l.cfg.TimestampFormat != "" {
+		buf = append(buf, '"')
+		buf = append(buf, ts...)
+		buf = append(buf, '"')
+	} else {
+		buf = append(buf, ts...)
+	}
 	buf = append(buf, `,"level":"`...)
 	buf = append(buf, e.Level.String()...)
 	buf = append(buf, '"')
@@ -175,7 +178,7 @@ func appendTextBytes(buf []byte, s []byte) []byte {
 	start := 0
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if (c >= 0x20 && c != 0x7F) || c == '\t' {
+		if textSafe[c] {
 			continue
 		}
 		if start < i {
@@ -237,6 +240,26 @@ func appendFieldsJSON(buf []byte, fields []string) []byte {
 	return buf
 }
 
+// jsonSafe[c] reports whether byte c is copied unchanged into a JSON string:
+// printable ASCII except '"' and '\\'. Bytes >= 0x80 are not marked safe; they
+// take the UTF-8 validation path. A table lookup replaces five comparisons per
+// byte in the escaper's inner loop.
+var jsonSafe = func() (t [256]bool) {
+	for c := 0x20; c < 0x7F; c++ {
+		t[c] = c != '"' && c != '\\'
+	}
+	return t
+}()
+
+// textSafe[c] reports whether byte c is copied unchanged into text output:
+// everything except control characters and DEL; a tab is kept.
+var textSafe = func() (t [256]bool) {
+	for c := 0; c < 256; c++ {
+		t[c] = (c >= 0x20 && c != 0x7F) || c == '\t'
+	}
+	return t
+}()
+
 // appendJSONString appends a JSON-escaped string (with surrounding quotes)
 // to buf. Control characters (< 0x20), DEL (0x7F), double quotes, and
 // backslashes are escaped per RFC 8259. Invalid UTF-8 bytes are replaced by
@@ -257,12 +280,12 @@ func appendJSONStringBytes(buf []byte, s []byte) []byte {
 	for i := 0; i < len(s); {
 		c := s[i]
 
-		if c < utf8.RuneSelf {
-			if c >= 0x20 && c != 0x7F && c != '"' && c != '\\' {
-				i++
-				continue
-			}
+		if jsonSafe[c] {
+			i++
+			continue
+		}
 
+		if c < utf8.RuneSelf {
 			if start < i {
 				buf = append(buf, s[start:i]...)
 			}

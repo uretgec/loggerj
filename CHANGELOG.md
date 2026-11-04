@@ -6,7 +6,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [1.5.0] - 2026-10-31
+## [1.5.1] - 2026-11-02
+
+Performance patch: no API, behavior or output changes. Based on the first Linux profile of v1.5.0 (GitHub-hosted amd64 runner, 4 vCPU).
+
+### Performance
+
+- **Timestamp rendered once per batch.** The worker used to format the timestamp digits for every entry; in the Linux profile `appendTimestamp` was ~15% of the worker's time for text output and ~9% for JSON. The digits are now rendered once per batch and copied. Sync mode still stamps each entry when it is logged.
+- **Lookup tables in the string escapers.** The JSON string escaper (`appendJSONStringBytes`, ~26% of the worker's time for JSON output in the profile) and the text escaper test each byte with a table lookup instead of several comparisons. The output is identical (`FuzzAppendJSONString`, `TestAppendTextBytes_Table`, and new table tests).
+- The gain has not been measured yet: compare `BenchmarkE2E_*` (delivered/s) and the new `BenchmarkAppendJSONString` / `BenchmarkAppendTextString` with v1.5.0, for example with the `linux-profile` workflow (`compare_ref: v1.5.0`).
+
+### Repository
+
+- `linux-profile` workflow and `profile-inner.sh` / Docker files for Linux benchmarks and CPU/mutex profiles (manual run). The workflow also profiles `Log_Enqueue_Slog`.
+- `.github/dependabot.yml` keeps the GitHub Actions up to date.
+- BENCH.md: Linux amd64 results for v1.5.0.
+
+---
+
+## [1.5.0] - 2026-10-30
 
 Minor release: faster worker, simpler lifecycle, new options, and several behavior changes. Read "Upgrading" before updating a service that depends on log volume or on the exact text output.
 
@@ -125,7 +143,7 @@ Patch release: bug fixes and documentation corrections. The gate order (rate lim
 - **Rate-limit cost math fix:** Corrected total real-world cost calculation to ~36.5ns.
 - **slog time.Time precision fix:** Changed `time.RFC3339` to `time.RFC3339Nano` in `SlogHandler` to preserve sub-second precision for audit trails.
 
-### Testing#2
+### Testing
 
 - **Build tag test files:** Split `TestAsWriter_ZeroAlloc` into Go 1.21 and Go 1.22+ specific files.
 - **New test:** `TestSlogHandler_TimePrecision` verifies nanosecond preservation.

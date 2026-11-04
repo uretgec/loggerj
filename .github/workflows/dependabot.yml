@@ -1,0 +1,9 @@
+# Keeps the GitHub Actions used by the workflows up to date.
+# Dependabot opens a pull request when an action has a new major version
+# (for example when a Node runtime is deprecated).
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"

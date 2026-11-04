@@ -39,9 +39,9 @@ run_bench() {
 		-test.count="$COUNT" | tee "$OUT/bench.txt"
 }
 
-# profile_one NAME BENCH_REGEX
+# profile_one NAME BENCH_REGEX [PRODUCER_FOCUS]
 profile_one() {
-	local name="$1" pattern="$2"
+	local name="$1" pattern="$2" producer_focus="${3:-benchmarkE2E}"
 	local bin="$OUT/loggerj.test"
 
 	"$bin" \
@@ -55,13 +55,15 @@ profile_one() {
 	go tool pprof -top -cum -nodecount=40 "$bin" "$OUT/cpu_${name}.out" >"$OUT/cpu_${name}_top_cum.txt" 2>&1 || true
 	go tool pprof -top -nodecount=40 "$bin" "$OUT/cpu_${name}.out" >"$OUT/cpu_${name}_top_flat.txt" 2>&1 || true
 	go tool pprof -top -cum -nodecount=40 -focus='runWorker|StartWithWriter' "$bin" "$OUT/cpu_${name}.out" >"$OUT/cpu_${name}_worker.txt" 2>&1 || true
-	go tool pprof -top -cum -nodecount=40 -focus='benchmarkE2E' "$bin" "$OUT/cpu_${name}.out" >"$OUT/cpu_${name}_producer.txt" 2>&1 || true
+	go tool pprof -top -cum -nodecount=40 -focus="$producer_focus" "$bin" "$OUT/cpu_${name}.out" >"$OUT/cpu_${name}_producer.txt" 2>&1 || true
 	go tool pprof -top -nodecount=30 "$bin" "$OUT/mutex_${name}.out" >"$OUT/mutex_${name}_top.txt" 2>&1 || true
 }
 
 run_profiles() {
 	profile_one e2e_nofields 'E2E_NoFields_Text$'
 	profile_one e2e_typed_json 'E2E_TypedFields_JSON$'
+	# Enqueue-only: no worker runs, so the whole profile is the caller side.
+	profile_one enqueue_slog 'Log_Enqueue_Slog$' 'benchmarkEnqueue'
 }
 
 case "$MODE" in

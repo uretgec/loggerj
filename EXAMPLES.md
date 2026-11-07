@@ -636,12 +636,15 @@ func LoggerMiddleware(logger *loggerj.Logger) fiber.Handler {
         start := time.Now()
         err := c.Next()
 
+        // Fiber/fasthttp strings alias buffers that are reused after the
+        // handler returns, and loggerj's async worker reads the strings
+        // later: copy them (or set fiber.Config{Immutable: true}).
         logger.InfoString("HTTP", "request",
-            "method", c.Method(),
-            "path", c.Path(),
+            "method", strings.Clone(c.Method()),
+            "path", strings.Clone(c.Path()),
             "status", fmt.Sprintf("%d", c.Response().StatusCode()),
             "duration_ms", fmt.Sprintf("%d", time.Since(start).Milliseconds()),
-            "ip", c.IP())
+            "ip", strings.Clone(c.IP()))
 
         return err
     }

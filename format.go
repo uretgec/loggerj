@@ -178,7 +178,7 @@ func appendTextBytes(buf []byte, s []byte) []byte {
 	start := 0
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if textSafe[c] {
+		if (c >= 0x20 && c != 0x7F) || c == '\t' {
 			continue
 		}
 		if start < i {
@@ -240,26 +240,6 @@ func appendFieldsJSON(buf []byte, fields []string) []byte {
 	return buf
 }
 
-// jsonSafe[c] reports whether byte c is copied unchanged into a JSON string:
-// printable ASCII except '"' and '\\'. Bytes >= 0x80 are not marked safe; they
-// take the UTF-8 validation path. A table lookup replaces five comparisons per
-// byte in the escaper's inner loop.
-var jsonSafe = func() (t [256]bool) {
-	for c := 0x20; c < 0x7F; c++ {
-		t[c] = c != '"' && c != '\\'
-	}
-	return t
-}()
-
-// textSafe[c] reports whether byte c is copied unchanged into text output:
-// everything except control characters and DEL; a tab is kept.
-var textSafe = func() (t [256]bool) {
-	for c := 0; c < 256; c++ {
-		t[c] = (c >= 0x20 && c != 0x7F) || c == '\t'
-	}
-	return t
-}()
-
 // appendJSONString appends a JSON-escaped string (with surrounding quotes)
 // to buf. Control characters (< 0x20), DEL (0x7F), double quotes, and
 // backslashes are escaped per RFC 8259. Invalid UTF-8 bytes are replaced by
@@ -280,12 +260,12 @@ func appendJSONStringBytes(buf []byte, s []byte) []byte {
 	for i := 0; i < len(s); {
 		c := s[i]
 
-		if jsonSafe[c] {
-			i++
-			continue
-		}
-
 		if c < utf8.RuneSelf {
+			if c >= 0x20 && c != 0x7F && c != '"' && c != '\\' {
+				i++
+				continue
+			}
+
 			if start < i {
 				buf = append(buf, s[start:i]...)
 			}

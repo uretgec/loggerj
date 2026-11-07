@@ -272,6 +272,7 @@ type Stats struct {
 	ChannelCap      uint64
 	SyncWriteErrors uint64 // Non-zero means at least one sync-mode write failed
 	RotationErrors  uint64 // Non-zero means at least one rotation step failed
+	WriteErrors     uint64 // Non-zero means at least one async write or flush failed
 }
 
 // Stats returns a snapshot of logger statistics.
@@ -287,6 +288,7 @@ func (l *Logger) Stats() Stats {
 		ChannelCap:      uint64(cap(l.logCh)),
 		SyncWriteErrors: l.syncWriteErrors.Load(),
 		RotationErrors:  l.rotationErrors.Load(),
+		WriteErrors:     l.writeErrors.Load(),
 	}
 }
 

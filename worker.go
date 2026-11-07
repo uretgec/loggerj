@@ -128,6 +128,7 @@ func (l *Logger) runWorker(ctx context.Context, w io.Writer, ready chan<- struct
 	if !ok {
 		bw = bufio.NewWriterSize(w, l.cfg.WriterBufferSize)
 	}
+	l.workerOut = w
 
 	ticker := time.NewTicker(l.cfg.FlushTimeout)
 	defer ticker.Stop()
@@ -199,16 +200,45 @@ func (l *Logger) writeOut(bw *bufio.Writer, buf []byte) int {
 		return 0
 	}
 	written := len(buf)
+	failed := false
 	if _, err := bw.Write(buf); err != nil {
-		fmt.Fprintf(os.Stderr, "loggerj: write error: %v\n", err)
+		l.noteWriteError("write", err)
+		failed = true
 	}
 	if err := bw.Flush(); err != nil {
-		fmt.Fprintf(os.Stderr, "loggerj: flush error: %v\n", err)
+		l.noteWriteError("flush", err)
+		failed = true
+	}
+	if failed {
+		l.clearWriterError(bw)
 	}
 	if l.cfg.OutputFile != "" {
 		l.currentSize += int64(written)
 	}
 	return written
+}
+
+// noteWriteError counts a failed write or flush of the worker and reports it
+// to stderr at most once per warnInterval.
+func (l *Logger) noteWriteError(op string, err error) {
+	n := l.writeErrors.Add(1)
+	warnLimited(&l.lastWriteWarn, "loggerj: async %s error: %v (%d write errors so far; further messages are suppressed for %v)\n",
+		op, err, n, warnInterval)
+}
+
+// clearWriterError makes bw usable again after a failed write. A
+// bufio.Writer refuses all further writes after its first error, so without
+// this a single transient error (a full disk, a dropped connection) would
+// stop the output until the process restarts. The entries of the failed batch
+// are lost; they were counted in Stats().WriteErrors.
+func (l *Logger) clearWriterError(bw *bufio.Writer) {
+	if bw == l.currentWriter && l.currentFile != nil {
+		bw.Reset(l.currentFile)
+		return
+	}
+	if out := l.workerOut; out != nil && out != io.Writer(bw) {
+		bw.Reset(out)
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -236,9 +266,13 @@ func (l *Logger) drainAndFlush(bw *bufio.Writer, buf []byte) {
 	}
 }
 
+// flushTimeout bounds how long Flush waits for the worker.
+const flushTimeout = time.Second
+
 // Flush forces an immediate flush of all pending log entries. It signals
 // the worker to drain the channel and write the buffer, then blocks until
-// the worker confirms completion (or times out after 1 second).
+// the worker confirms completion. The whole call waits at most one second,
+// even when the worker is stuck (for example in a blocked writer).
 //
 // If no worker is running, Flush returns immediately and the pending entries
 // stay queued: they are written when a worker starts, or counted in Drops()
@@ -267,15 +301,19 @@ func (l *Logger) Flush() {
 		return
 	}
 
-	done := make(chan struct{})
-	// flushCh has capacity 1. Since we hold flushMu, it is guaranteed
-	// to be empty, so this send will never block.
-	l.flushCh <- done
-
-	// Use time.NewTimer instead of time.After to prevent timer leaks
-	// when the worker responds quickly.
-	timer := time.NewTimer(1 * time.Second)
+	// One timer bounds the whole call: handing the request to the worker and
+	// waiting for it. A worker stuck in a blocked writer cannot hold Flush
+	// (and flushMu) forever, and a request left in flushCh by a call that
+	// timed out cannot block the next one.
+	timer := time.NewTimer(flushTimeout)
 	defer timer.Stop()
+
+	done := make(chan struct{})
+	select {
+	case l.flushCh <- done:
+	case <-timer.C:
+		return
+	}
 
 	select {
 	case <-done:

@@ -6,6 +6,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.5.2] - 2026-11-05
+
+Hardening release. From this version the design is frozen: bug fixes, Go version support and documentation only.
+
+### Fixed
+
+- **`Flush()` could hang forever.** When the worker was stuck in a blocked writer, the first `Flush` timed out and left its request in the channel; the next `Flush` then blocked on the send without a timeout, holding `flushMu`. The whole call now waits at most one second.
+- **One failed write stopped all async output.** A `bufio.Writer` refuses every write after its first error, so a transient error (a full disk, a dropped connection) silenced the logger until restart. The worker now clears the error and writes again when the writer recovers. The entries of the failed batch are lost.
+- **Write and rotation errors flooded stderr.** A persistent failure printed a line on every flush. Messages for write errors and for rotation errors are now limited to one per 10 seconds each; the counters keep counting every failure.
+
+### Added
+
+- `Stats.WriteErrors`: failed writes and flushes of the async worker. (An addition in a patch release; the field is new and nothing else changes.)
+- `compat` CI workflow: tests on Linux, macOS and Windows with the minimum and the latest Go version. Windows has not been run before; failures there are findings, not regressions.
+- Tests: a blocked writer, a failing writer that recovers, and a concurrent load test (meant for `-race`).
+
+### Documentation
+
+- README: "Status and scope" and "Known limitations"; package documentation: caveats about string arguments and message size.
+- The Fiber example copied no strings; Fiber and fasthttp values alias buffers that are reused, and the async worker reads them later. The example now copies them.
+- ROADMAP: the design is frozen; ideas that need a real workload are listed as not planned, and the v2 ideas are collected there.
+
+### Removed (internal)
+
+- The byte-class lookup tables of the JSON and text escapers (added in 1.5.1): they had no measurable effect. The output is unchanged.
+- `BenchmarkAppendJSONString` and `BenchmarkAppendTextString`, which were only added to measure them.
+
+---
+
 ## [1.5.1] - 2026-11-02
 
 Performance patch: no API, behavior or output changes. Based on the first Linux profile of v1.5.0 (GitHub-hosted amd64 runner, 4 vCPU).
@@ -18,7 +47,7 @@ Performance patch: no API, behavior or output changes. Based on the first Linux 
 
 ### Repository
 
-- `linux-profile` workflow and `profile-inner.sh` / Docker files for Linux benchmarks and CPU/mutex profiles (manual run). The workflow also profiles `Log_Enqueue_Slog`.
+- `linux-profile` workflow and `profile-inner.sh` for Linux benchmarks and CPU/mutex profiles (manual run). The workflow also profiles `Log_Enqueue_Slog`.
 - `.github/dependabot.yml` keeps the GitHub Actions up to date.
 - BENCH.md: Linux amd64 results for v1.5.0.
 

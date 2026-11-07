@@ -53,16 +53,29 @@ Theme: **Throughput, lifecycle and cleanup.** See CHANGELOG.md.
 
 ---
 
-## 🔮 Next (not scheduled)
+## ✅ v1.5.1 and v1.5.2 — Completed
 
-### Measure first
+- [x] v1.5.1: timestamp rendered once per batch (+9% to +13% delivered/s on the Linux runner).
+- [x] v1.5.2: hardening. `Flush()` is bounded, async write errors are counted (`Stats.WriteErrors`) and the worker recovers from them, stderr messages are rate-limited, caveats are documented, a CI compatibility job covers Windows, macOS and newer Go versions.
 
-- [x] Profile the async path on Linux (v1.5.0, 4 vCPU runner). The worker spends ~48% of its time in `chanrecv` and ~15% in `sync.Pool.Put`, formatting ~31%; the producer ~54% in `chansend` and ~20% in `sync.Pool.Get`; the mutex profile is entirely the runtime's channel lock. This is the case for the ring buffer below.
-- [x] Profile `Log_Enqueue_Slog` (138 ns on the Linux runner): the context lookups are ~3%; most of the time is the slog API itself (record copy, attribute conversion) and the queue handoff. No action.
-- [x] Re-profile after v1.5.1: the worker still spends over 60% of its time in queue operations (`chanrecv`, `sync.Pool.Put`) and ~31% formatting. For JSON output, `appendJSONStringBytes` is ~29% of the worker, but it is dominated by per-call overhead on short strings, not by bytes scanned (the lookup tables of v1.5.1 did not change its share). Pre-baking `"type":"..."` per profile would remove one call per entry.
-- [ ] Defer caller resolution to the worker: store the PC and resolve it with `runtime.CallersFrames`. Verify how `runtime.Callers` with a one-element buffer behaves for inlined frames across Go 1.21-1.24 before shipping.
-- [ ] Bounded MPSC ring buffer of pre-allocated entries instead of channel + `sync.Pool` (the v1.4.4 profile showed channel lock and pool contention).
+**The design is frozen from v1.5.2**: bug fixes, Go version support and documentation only. Everything below needs a real workload that asks for it.
+
+---
+
+## Not planned unless a real workload needs it
+
+### Performance (measure first)
+
+- [ ] Bounded MPSC ring buffer of pre-allocated entries instead of channel + `sync.Pool`. The Linux profile of v1.5.0/v1.5.1 shows the worker spending over 60% of its time in queue operations (`chanrecv`, `sync.Pool.Put`) and the producer about 58% in `chansend` plus 24% in `sync.Pool.Get`; the mutex profile is entirely the runtime's channel lock. It needs a written design (wake-up of an idle worker, `Flush`/`Close`, `ChannelSize`, drop semantics) and a prototype that beats the channel by a wide margin before it is integrated.
+- [ ] Defer caller resolution to the worker: store the PC and resolve it with `runtime.CallersFrames`. Verify how `runtime.Callers` with a one-element buffer behaves for inlined frames across Go versions first.
+- [ ] Pre-bake `"type":"..."` per profile (one escaper call less per JSON entry); the escaper cost is per call on short strings, not per byte.
 - [ ] Rotation check on the `Flush()` path.
+
+### Behavior
+
+- [ ] Copy string arguments at call time (safe by default for fasthttp/Fiber values), with an opt-out. Costs time on the calling goroutine.
+- [ ] `Config.MaxMessageBytes` to bound the memory held by the queue.
+- [ ] Timestamp taken at call time (opt-in). Costs one clock read per call.
 
 ### Sync mode
 
@@ -71,7 +84,7 @@ Theme: **Throughput, lifecycle and cleanup.** See CHANGELOG.md.
 
 ### Output
 
-- [ ] Nested JSON objects (`WithNestedFields` baked at init; allocating encoder interface only for sync mode).
+- [ ] Nested JSON objects (`WithNestedFields` baked at init; an allocating encoder interface only for sync mode).
 - [ ] OpenTelemetry trace context behind a build tag; Prometheus collector as a sub-package.
 - [ ] Redaction: a static key set applied by the worker, rather than per-call hooks.
 
@@ -80,6 +93,27 @@ Theme: **Throughput, lifecycle and cleanup.** See CHANGELOG.md.
 - Multi-writer fan-out: `io.MultiWriter` with `StartWithWriter` already does it.
 - Network shipping: out of scope.
 - Plugin / Core interface: conflicts with the zero-overhead design.
+
+---
+
+## v2 ideas (not planned)
+
+Collected so that they are not forgotten. A v2 needs real user feedback, a `/v2` module path and a migration guide. None of this is scheduled.
+
+1. Module path `.../loggerj/v2`.
+2. Stop exporting `Entry`, `SubProfile`, `Entry.Reset`, `StdLogWriter` and the `FieldType` constants.
+3. Remove the deprecated `Config.RateLimitWindow`.
+4. `Start` does not block (`StartBackground` becomes `Start`); same for `StartWithWriter`.
+5. The default sync tier is `Direct` (today it is `OSBuffered`, the weakest).
+6. String arguments are copied at call time by default; a no-copy mode is opt-in.
+7. The timestamp is taken at call time by default.
+8. A consistent JSON layout: static and per-call fields in the same place, configurable key names.
+9. Text output quotes values with spaces (logfmt style).
+10. `RegisterSub(logType string, ...)` is replaced by the typed `Sub` handle only.
+11. `SetLevelValue` / `GetLevel` become `SetLevel` / `Level`.
+12. The slog adapter moves to its own package (`loggerj/slog`), so the core does not depend on slog.
+13. A default message size limit (`MaxMessageBytes`).
+14. The internal queue (for example a ring buffer) can be replaced at that point; it does not change the API, but a major release is a good time to share the risk.
 
 ---
 

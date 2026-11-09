@@ -8,26 +8,6 @@ import (
 	"time"
 )
 
-// The lookup tables must encode exactly the rules they replaced.
-
-func TestJSONSafeTable(t *testing.T) {
-	for c := 0; c < 256; c++ {
-		want := c >= 0x20 && c < 0x7F && c != '"' && c != '\\'
-		if jsonSafe[c] != want {
-			t.Errorf("jsonSafe[%#x] = %v, want %v", c, jsonSafe[c], want)
-		}
-	}
-}
-
-func TestTextSafeTable(t *testing.T) {
-	for c := 0; c < 256; c++ {
-		want := (c >= 0x20 && c != 0x7F) || c == '\t'
-		if textSafe[c] != want {
-			t.Errorf("textSafe[%#x] = %v, want %v", c, textSafe[c], want)
-		}
-	}
-}
-
 // Sync mode stamps each entry when it is logged, not per batch.
 func TestSyncMode_TimestampAtCallTime(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ts.log")

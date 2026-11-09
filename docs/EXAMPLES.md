@@ -636,12 +636,15 @@ func LoggerMiddleware(logger *loggerj.Logger) fiber.Handler {
         start := time.Now()
         err := c.Next()
 
+        // Fiber/fasthttp strings alias buffers that are reused after the
+        // handler returns, and loggerj's async worker reads the strings
+        // later: copy them (or set fiber.Config{Immutable: true}).
         logger.InfoString("HTTP", "request",
-            "method", c.Method(),
-            "path", c.Path(),
+            "method", strings.Clone(c.Method()),
+            "path", strings.Clone(c.Path()),
             "status", fmt.Sprintf("%d", c.Response().StatusCode()),
             "duration_ms", fmt.Sprintf("%d", time.Since(start).Milliseconds()),
-            "ip", c.IP())
+            "ip", strings.Clone(c.IP()))
 
         return err
     }
@@ -1430,4 +1433,4 @@ These examples demonstrate the core philosophy of `loggerj`:
 8. **Monitor sync write errors** via `Stats().SyncWriteErrors` for audit trails (v1.3.1).
 9. **Achieve true zero-allocation** and lock-free concurrency.
 
-For detailed performance metrics, see [BENCH.md](BENCH.md). For API reference, see [README.md](README.md). For competitor comparison, see [COMPARISON.md](COMPARISON.md).
+For detailed performance metrics, see [BENCH.md](BENCH.md). For API reference, see [README.md](../README.md). For competitor comparison, see [COMPARISON.md](COMPARISON.md).

@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue?style=for-the-badge" alt="License: MIT">
   <img src="https://img.shields.io/badge/Go-1.21+-00ADD8?style=for-the-badge&logo=go" alt="Go Version">
-  <img src="https://img.shields.io/badge/version-v1.5.1-green?style=for-the-badge" alt="Version: 1.5.1">
+  <img src="https://img.shields.io/badge/version-v1.5.2-green?style=for-the-badge" alt="Version: 1.5.2">
 </p>
 
 # loggerj
@@ -24,6 +24,12 @@ High-performance, zero-allocation asynchronous logging for Go.
 - **Overload visibility**: `Stats().Drops` and `Stats().DropsByLevel`; optional bounded wait for ERROR entries (`ErrorBlockTimeout`).
 - **Output options**: numeric JSON durations (`DurationUnit`), formatted timestamps (`TimestampFormat`), log file permissions (`FileMode`).
 - **Safe text output**: control characters in messages and values are escaped, so a value cannot start a new log line.
+
+## Status and scope
+
+loggerj is a small library with one maintainer. From v1.5.2 its API and internal design are considered frozen: planned work is limited to bug fixes, support for current Go versions and documentation. New features are added only when a real workload needs them (see ROADMAP.md).
+
+It is built for services that log from many goroutines, want a low and bounded cost on the calling goroutine, and accept dropping entries over blocking the caller. `SyncMode` is for the cases that need a documented durability tier. It is not a general logging framework: there are no hooks, no nested JSON objects, no network shipping and no time-based rotation. It has been benchmarked on Linux and macOS; Windows is only covered by the CI compatibility job.
 
 ## Quick Start
 
@@ -128,15 +134,27 @@ v1.5.0 changes some behavior; see CHANGELOG.md for details.
 - **Async Mode**: Designed for high-QPS microservices, gateways, and proxies where GC pauses from logging must be avoided. The async ns/op figures in BENCH.md are caller-side costs of an attempt; check `drops/op` and the `BenchmarkE2E_*` results for delivered throughput.
 - **Sync Mode**: For cases that need a documented durability tier. Each `DurabilityTier` states what it survives (table above).
 
-For detailed ns/op metrics, hardware benchmarks, and fair apples-to-apples comparisons with `zap`, `zerolog`, and `slog`, see **[BENCH.md](BENCH.md)**.
-For architectural trade-offs, missing features (like nested JSON objects), and migration guides, see **[COMPARISON.md](COMPARISON.md)**.
+For detailed ns/op metrics, hardware benchmarks, and fair apples-to-apples comparisons with `zap`, `zerolog`, and `slog`, see **[BENCH.md](docs/BENCH.md)**.
+For architectural trade-offs, missing features (like nested JSON objects), and migration guides, see **[COMPARISON.md](docs/COMPARISON.md)**.
+
+## Known limitations
+
+- **Async mode can lose entries.** On a crash or kill, entries in the queue and in the worker's buffer are lost, and entries are dropped (and counted) when the queue is full. Use `SyncMode` with `Direct` or `FsyncEveryWrite` when that is not acceptable.
+- **String arguments are read later in async mode.** The worker reads the strings of a log call after the call returned. Do not pass strings that alias a buffer the caller reuses (fasthttp and Fiber values such as `c.Path()`, unsafe conversions of byte slices); copy them first, for example with `strings.Clone`. `SyncMode` reads them before the call returns.
+- **Memory is bounded by the queue, not by the message size.** A queued entry holds a copy of its message, so a full queue holds about `ChannelSize` times the message size. There is no message size limit.
+- **Timestamps are taken by the worker** (once per batch), not when the log call is made. Under backpressure they can lag the event. `SyncMode` stamps at call time.
+- **Throughput of one worker is limited.** About 3 to 5 million entries per second on the machines measured (see BENCH.md); above that, entries are dropped.
+- **Text output does not quote values** that contain spaces, so parsing `key=value` for such values is ambiguous. Control characters are escaped. Use `JSONOutput` for machine parsing.
+- **The rate limit uses a fixed window**, so up to twice the limit can pass around a window boundary.
+- **One process should own a log file.** Rotation renames the file; several processes writing and rotating the same file will conflict. Rotation is size-based and async-mode only.
+- **Write failures** (a full disk, a broken connection) are counted in `Stats().WriteErrors` and printed to stderr at most once per 10 seconds; the entries of the failed batch are lost, and the worker writes again when the writer recovers.
 
 ## Documentation
 
-- **[EXAMPLES.md](EXAMPLES.md)** — Comprehensive examples for all features.
-- **[BENCH.md](BENCH.md)** — Detailed benchmark methodology and results.
-- **[COMPARISON.md](COMPARISON.md)** — Honest comparison with zap, zerolog, slog, logrus.
-- **[ROADMAP.md](ROADMAP.md)** — Future vision and development roadmap.
+- **[EXAMPLES.md](docs/EXAMPLES.md)** — Comprehensive examples for all features.
+- **[BENCH.md](docs/BENCH.md)** — Detailed benchmark methodology and results.
+- **[COMPARISON.md](docs/COMPARISON.md)** — Honest comparison with zap, zerolog, slog, logrus.
+- **[ROADMAP.md](docs/ROADMAP.md)** — Future vision and development roadmap.
 - **[CHANGELOG.md](CHANGELOG.md)** — Release notes and migration guides.
 
 ## License

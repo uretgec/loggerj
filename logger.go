@@ -60,6 +60,18 @@ type Logger struct {
 	// written to an unrotated file or lost entirely if reopen fails.
 	rotationErrors atomic.Uint64
 
+	// writeErrors counts failed writes and flushes of the async worker.
+	writeErrors atomic.Uint64
+
+	// lastWriteWarn and lastRotateWarn rate-limit the stderr messages for
+	// write and rotation errors (see warnLimited).
+	lastWriteWarn  atomic.Int64
+	lastRotateWarn atomic.Int64
+
+	// workerOut is the writer the running worker was started with. Only the
+	// worker goroutine uses it.
+	workerOut io.Writer
+
 	// Deterministic lifecycle synchronization.
 	// started is closed when the worker goroutine begins processing.
 	// workerDone is closed when the worker goroutine exits.

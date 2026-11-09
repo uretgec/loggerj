@@ -123,6 +123,9 @@ type Config struct {
 
 	// ChannelSize is the capacity of the internal log channel. Larger values
 	// provide more buffering for burst traffic. If full, entries are dropped.
+	// A queued entry holds a copy of its message, so a full queue holds about
+	// ChannelSize times the message size; loggerj does not limit the message
+	// size.
 	// Default: 4096
 	ChannelSize int
 

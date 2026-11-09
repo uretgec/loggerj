@@ -52,7 +52,7 @@ func (l *Logger) rotateIfNeeded(bw *bufio.Writer) *bufio.Writer {
 	}
 	rotated, err := l.rotateLogFile()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "loggerj: rotation error: %v\n", err)
+		warnLimited(&l.lastRotateWarn, "loggerj: rotation error: %v\n", err)
 	}
 	if rotated {
 		return l.currentWriter
@@ -120,13 +120,13 @@ func (l *Logger) rotateLogFile() (rotated bool, err error) {
 	if l.currentWriter != nil {
 		if err := l.currentWriter.Flush(); err != nil {
 			l.rotationErrors.Add(1)
-			fmt.Fprintf(os.Stderr, "loggerj: flush before rotation failed: %v\n", err)
+			warnLimited(&l.lastRotateWarn, "loggerj: flush before rotation failed: %v\n", err)
 		}
 	}
 	if l.currentFile != nil {
 		if err := l.currentFile.Close(); err != nil {
 			l.rotationErrors.Add(1)
-			fmt.Fprintf(os.Stderr, "loggerj: close before rotation failed: %v\n", err)
+			warnLimited(&l.lastRotateWarn, "loggerj: close before rotation failed: %v\n", err)
 		}
 	}
 
@@ -149,14 +149,14 @@ func (l *Logger) rotateLogFile() (rotated bool, err error) {
 		dst := fmt.Sprintf("%s.%d", l.outputFilePath, i+1)
 		if err := os.Rename(src, dst); err != nil && !os.IsNotExist(err) {
 			l.rotationErrors.Add(1)
-			fmt.Fprintf(os.Stderr, "loggerj: failed to rotate backup %d -> %d: %v\n", i, i+1, err)
+			warnLimited(&l.lastRotateWarn, "loggerj: failed to rotate backup %d -> %d: %v\n", i, i+1, err)
 		}
 	}
 
 	// Step 3: the rotated log becomes backup .1.
 	if err := os.Rename(rotating, l.outputFilePath+".1"); err != nil {
 		l.rotationErrors.Add(1)
-		fmt.Fprintf(os.Stderr, "loggerj: failed to move %s to backup .1 (left in place): %v\n", rotating, err)
+		warnLimited(&l.lastRotateWarn, "loggerj: failed to move %s to backup .1 (left in place): %v\n", rotating, err)
 	}
 
 	// Step 4: create a fresh log file.

@@ -1172,28 +1172,3 @@ func BenchmarkLog_Enqueue_Slog(b *testing.B) {
 		_ = handler.Handle(ctx, r)
 	})
 }
-
-// -----------------------------------------------------------------------------
-// v1.5.1: escaper micro-benchmarks
-// -----------------------------------------------------------------------------
-
-// A typical short value: printable ASCII, nothing to escape.
-const benchEscapeInput = "GET /api/v1/users?id=12345 HTTP/1.1 from 192.168.1.50"
-
-func BenchmarkAppendJSONString(b *testing.B) {
-	buf := make([]byte, 0, 256)
-	b.ReportAllocs()
-	b.SetBytes(int64(len(benchEscapeInput)))
-	for i := 0; i < b.N; i++ {
-		buf = appendJSONString(buf[:0], benchEscapeInput)
-	}
-}
-
-func BenchmarkAppendTextString(b *testing.B) {
-	buf := make([]byte, 0, 256)
-	b.ReportAllocs()
-	b.SetBytes(int64(len(benchEscapeInput)))
-	for i := 0; i < b.N; i++ {
-		buf = appendTextString(buf[:0], benchEscapeInput)
-	}
-}

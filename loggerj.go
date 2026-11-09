@@ -62,6 +62,19 @@
 //	ctx = context.WithValue(ctx, loggerj.TraceIDKey, "abc-123")
 //	logger.InfoCtx(ctx, "HTTP", "traced request", "method", "POST")
 //
+// # Caveats
+//
+//   - In async mode (the default) the string arguments of a log call are read
+//     later, by the worker. Do not pass strings that alias a buffer the caller
+//     reuses (for example fasthttp or Fiber values such as c.Path(), or unsafe
+//     conversions of byte slices); copy them first, for example with
+//     strings.Clone. SyncMode reads them before the call returns.
+//   - A queued entry holds a copy of its message, so a full queue holds about
+//     Config.ChannelSize times the message size. loggerj does not limit the
+//     message size.
+//   - Async mode can lose entries on a crash and drops entries when the queue
+//     is full; see the durability table in the README.
+//
 // # Performance
 // See BENCH.md for detailed benchmark results and methodology.
 package loggerj

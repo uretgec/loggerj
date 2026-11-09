@@ -6,6 +6,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.5.2] - 2026-11-05
+
+Hardening release. From this version the design is frozen: bug fixes, Go version support and documentation only.
+
+### Fixed
+
+- **`Flush()` could hang forever.** When the worker was stuck in a blocked writer, the first `Flush` timed out and left its request in the channel; the next `Flush` then blocked on the send without a timeout, holding `flushMu`. The whole call now waits at most one second.
+- **One failed write stopped all async output.** A `bufio.Writer` refuses every write after its first error, so a transient error (a full disk, a dropped connection) silenced the logger until restart. The worker now clears the error and writes again when the writer recovers. The entries of the failed batch are lost.
+- **Write and rotation errors flooded stderr.** A persistent failure printed a line on every flush. Messages for write errors and for rotation errors are now limited to one per 10 seconds each; the counters keep counting every failure.
+
+### Added
+
+- `Stats.WriteErrors`: failed writes and flushes of the async worker. (An addition in a patch release; the field is new and nothing else changes.)
+- `compat` CI workflow: tests on Linux, macOS and Windows with the minimum and the latest Go version. Windows has not been run before; failures there are findings, not regressions.
+- Tests: a blocked writer, a failing writer that recovers, and a concurrent load test (meant for `-race`).
+
+### Documentation
+
+- README: "Status and scope" and "Known limitations"; package documentation: caveats about string arguments and message size.
+- The Fiber example copied no strings; Fiber and fasthttp values alias buffers that are reused, and the async worker reads them later. The example now copies them.
+- ROADMAP: the design is frozen; ideas that need a real workload are listed as not planned, and the v2 ideas are collected there.
+
+### Removed (internal)
+
+- The byte-class lookup tables of the JSON and text escapers (added in 1.5.1): they had no measurable effect. The output is unchanged.
+- `BenchmarkAppendJSONString` and `BenchmarkAppendTextString`, which were only added to measure them.
+
+---
+
 ## [1.5.1] - 2026-11-02
 
 Performance patch: no API, behavior or output changes. Based on the first Linux profile of v1.5.0 (GitHub-hosted amd64 runner, 4 vCPU).
@@ -13,12 +42,12 @@ Performance patch: no API, behavior or output changes. Based on the first Linux 
 ### Performance
 
 - **Timestamp rendered once per batch.** The worker used to format the timestamp digits for every entry; in the Linux profile `appendTimestamp` was ~15% of the worker's time for text output and ~9% for JSON. The digits are now rendered once per batch and copied. Sync mode still stamps each entry when it is logged.
-- **Lookup tables in the string escapers.** The JSON string escaper (`appendJSONStringBytes`, ~26% of the worker's time for JSON output in the profile) and the text escaper test each byte with a table lookup instead of several comparisons. The output is identical (`FuzzAppendJSONString`, `TestAppendTextBytes_Table`, and new table tests).
-- The gain has not been measured yet: compare `BenchmarkE2E_*` (delivered/s) and the new `BenchmarkAppendJSONString` / `BenchmarkAppendTextString` with v1.5.0, for example with the `linux-profile` workflow (`compare_ref: v1.5.0`).
+- **Lookup tables in the string escapers.** The JSON string escaper (`appendJSONStringBytes`, ~26% of the worker's time for JSON output in the profile) and the text escaper test each byte with a table lookup instead of several comparisons. The output is identical (`FuzzAppendJSONString`, `TestAppendTextBytes_Table`, and new table tests). **No measurable effect:** in the v1.5.1 profile `appendJSONStringBytes` is still ~27-30% of the JSON worker's time. The strings are short (keys and values of a few bytes), so the cost is per call, not per byte.
+- Measured on the Linux runner against v1.5.0 (`benchstat`, `-count=10`): `E2E_NoFields_Text` delivered/s 4.40M -> 4.78M (+8.6%, p=0.002), `E2E_TypedFields_JSON` 2.77M -> 3.13M (+12.9%, p<0.001); per delivered entry 227 -> 209 ns and 361 -> 320 ns. The gain comes from the timestamp change; the tables did not add a measurable share.
 
 ### Repository
 
-- `linux-profile` workflow and `profile-inner.sh` / Docker files for Linux benchmarks and CPU/mutex profiles (manual run). The workflow also profiles `Log_Enqueue_Slog`.
+- `linux-profile` workflow and `profile-inner.sh` for Linux benchmarks and CPU/mutex profiles (manual run). The workflow also profiles `Log_Enqueue_Slog`.
 - `.github/dependabot.yml` keeps the GitHub Actions up to date.
 - BENCH.md: Linux amd64 results for v1.5.0.
 

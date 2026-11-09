@@ -94,6 +94,24 @@ The `sec/op` column of `benchstat` for the E2E benchmarks is not meaningful here
 
 Clock read on this VM: `time.Now().UnixMilli()` 56.8 ns, `monoMillis()` 30.3 ns (-47%), so the rate limiter's monotonic clock helps here as much as on the Apple M1 Pro. Clock reads are noticeably slower on this VM than on the M1, which is why `Log_RateLimited` is dominated by the clock read.
 
+### v1.5.1 against v1.5.0 (same runner, `-count=10`)
+
+| Benchmark | v1.5.0 | v1.5.1 | Change |
+|---|---:|---:|---:|
+| `E2E_NoFields_Text` delivered/s | 4.40M | 4.78M | +8.6% (p=0.002) |
+| `E2E_TypedFields_JSON` delivered/s | 2.77M | 3.13M | +12.9% (p<0.001) |
+| `E2E_NoFields_Text` per delivered entry | 227 ns | 209 ns | -7.9% |
+| `E2E_TypedFields_JSON` per delivered entry | 361 ns | 320 ns | -11.4% |
+| `E2E_TypedFields_JSON` drops/op | 0.52 | 0.42 | -18% |
+| `Log_RateLimited` | 40.95 ns | 40.96 ns | ~ |
+| `Log_Filtered` | 2.50 ns | 2.81 ns | +12.6% (see below) |
+
+`Log_Filtered` runs only the level check, which v1.5.1 did not touch. Its time alternates between about 2.50 ns and about 2.82 ns from build to build (v1.4.4: 2.82 ns, v1.5.0: 2.50 ns, v1.5.1: 2.81 ns), which looks like code alignment, not a change in the code path. For a benchmark this short, 0.3 ns is above a 10% threshold. The `sec/op` of `E2E_TypedFields_JSON` (+4.9%) is the usual drop-mix artifact: delivered/s rose by 12.9%.
+
+Where the worker's time goes in v1.5.1 (CPU profile, `E2E_NoFields_Text`): receiving from the channel (`chanrecv`) about 48% and `sync.Pool.Put` about 14%, together over 60%; formatting about 31%. For `E2E_TypedFields_JSON`, formatting is about 54% of the worker, of which `appendJSONStringBytes` is about 29%. The first access to a queued entry in the worker also shows up as `Level.String` and `appendTextBytes` flat time (about 5% each): the entry was written by another core, so this is the cost of the cache-line transfer, not of the work itself.
+
+`Log_Enqueue_Slog` (138 ns on this runner): `Handle` is about 70% of the profile, of which `logTyped` (queue handoff) 40%, `slog.Record.Attrs` and the attribute conversion about 30%, copying the `slog.Record` (passed by value) about 7%, and the context lookups about 3%. The profile also includes the untimed drain between chunks. Nothing in it points at a loggerj-specific problem; most of the difference to `Enqueue_TypedFields` is the shape of the slog API.
+
 Drop-free enqueue cost on the same runner (v1.4.4 has no such benchmarks): `Log_Enqueue_NoFields` 46.1 ns, `Log_Enqueue_StringAPI` 49.5 ns, `Log_Enqueue_TypedFields` 67-73 ns (noisy), `Log_Enqueue_Sub` 50.5 ns, `Log_Enqueue_Slog` 138 ns. As on the M1, the `SubLogger` handle is not faster than `InfoString` with a log type.
 
 ## 1. Async Mode (Intended Usage)

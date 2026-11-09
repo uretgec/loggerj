@@ -75,4 +75,4 @@ coverage.out
 *.test
 
 # Local benchmark captures
-bench/*.txt
+bench/*.txtprofiles/

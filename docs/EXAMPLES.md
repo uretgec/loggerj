@@ -1433,4 +1433,4 @@ These examples demonstrate the core philosophy of `loggerj`:
 8. **Monitor sync write errors** via `Stats().SyncWriteErrors` for audit trails (v1.3.1).
 9. **Achieve true zero-allocation** and lock-free concurrency.
 
-For detailed performance metrics, see [BENCH.md](BENCH.md). For API reference, see [README.md](README.md). For competitor comparison, see [COMPARISON.md](COMPARISON.md).
+For detailed performance metrics, see [BENCH.md](BENCH.md). For API reference, see [README.md](../README.md). For competitor comparison, see [COMPARISON.md](COMPARISON.md).

@@ -134,8 +134,8 @@ v1.5.0 changes some behavior; see CHANGELOG.md for details.
 - **Async Mode**: Designed for high-QPS microservices, gateways, and proxies where GC pauses from logging must be avoided. The async ns/op figures in BENCH.md are caller-side costs of an attempt; check `drops/op` and the `BenchmarkE2E_*` results for delivered throughput.
 - **Sync Mode**: For cases that need a documented durability tier. Each `DurabilityTier` states what it survives (table above).
 
-For detailed ns/op metrics, hardware benchmarks, and fair apples-to-apples comparisons with `zap`, `zerolog`, and `slog`, see **[BENCH.md](BENCH.md)**.
-For architectural trade-offs, missing features (like nested JSON objects), and migration guides, see **[COMPARISON.md](COMPARISON.md)**.
+For detailed ns/op metrics, hardware benchmarks, and fair apples-to-apples comparisons with `zap`, `zerolog`, and `slog`, see **[BENCH.md](docs/BENCH.md)**.
+For architectural trade-offs, missing features (like nested JSON objects), and migration guides, see **[COMPARISON.md](docs/COMPARISON.md)**.
 
 ## Known limitations
 
@@ -151,10 +151,10 @@ For architectural trade-offs, missing features (like nested JSON objects), and m
 
 ## Documentation
 
-- **[EXAMPLES.md](EXAMPLES.md)** — Comprehensive examples for all features.
-- **[BENCH.md](BENCH.md)** — Detailed benchmark methodology and results.
-- **[COMPARISON.md](COMPARISON.md)** — Honest comparison with zap, zerolog, slog, logrus.
-- **[ROADMAP.md](ROADMAP.md)** — Future vision and development roadmap.
+- **[EXAMPLES.md](docs/EXAMPLES.md)** — Comprehensive examples for all features.
+- **[BENCH.md](docs/BENCH.md)** — Detailed benchmark methodology and results.
+- **[COMPARISON.md](docs/COMPARISON.md)** — Honest comparison with zap, zerolog, slog, logrus.
+- **[ROADMAP.md](docs/ROADMAP.md)** — Future vision and development roadmap.
 - **[CHANGELOG.md](CHANGELOG.md)** — Release notes and migration guides.
 
 ## License

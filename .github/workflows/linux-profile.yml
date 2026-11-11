@@ -52,7 +52,7 @@ jobs:
           set -euo pipefail
           # benchstat@latest needs a newer Go than 1.24; the go command downloads that
           # toolchain automatically for this install only (about a minute).
-          go install golang.org/x/perf/cmd/benchstat@latest
+          GOTOOLCHAIN=auto go install golang.org/x/perf/cmd/benchstat@latest
 
           # Only benchmarks that exist in both versions.
           PAT='E2E_|Log_Filtered$|Log_RateLimited$|TimeNowUnixMilli'

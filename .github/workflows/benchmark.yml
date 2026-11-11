@@ -38,7 +38,7 @@ jobs:
         run: go build -o bin/benchgate ./tools/benchgate
 
       - name: Install benchstat
-        run: go install golang.org/x/perf/cmd/benchstat@latest
+        run: GOTOOLCHAIN=auto go install golang.org/x/perf/cmd/benchstat@latest
 
       - name: Prepare protected benchmark list
         run: cp hotpath.txt .pr-hotpath.txt

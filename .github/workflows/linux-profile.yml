@@ -82,7 +82,7 @@ jobs:
           show "CPU (flat): Enqueue_Slog" "$OUT_DIR/cpu_enqueue_slog_top_flat.txt" 35
           show "CPU (cum): Enqueue_Slog" "$OUT_DIR/cpu_enqueue_slog_top_cum.txt" 35
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: ${{ always() }}
         with:
           name: linux-profile-${{ github.run_number }}

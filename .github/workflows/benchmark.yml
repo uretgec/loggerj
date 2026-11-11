@@ -20,13 +20,13 @@ jobs:
 
     steps:
       - name: Checkout PR head
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: '1.24.x'
           cache: true
@@ -38,7 +38,7 @@ jobs:
         run: go build -o bin/benchgate ./tools/benchgate
 
       - name: Install benchstat
-        run: go install golang.org/x/perf/cmd/benchstat@latest
+        run: GOTOOLCHAIN=auto go install golang.org/x/perf/cmd/benchstat@latest
 
       - name: Prepare protected benchmark list
         run: cp hotpath.txt .pr-hotpath.txt
@@ -62,7 +62,7 @@ jobs:
             ./... | tee pr-bench.txt
 
       - name: Checkout base
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 0
@@ -90,7 +90,7 @@ jobs:
             ./... | tee base-bench.txt
 
       - name: Checkout PR head again
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
@@ -115,7 +115,7 @@ jobs:
       - name: Comment PR
         if: always()
         continue-on-error: true
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
@@ -161,7 +161,7 @@ jobs:
 
       - name: Upload benchmark artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: benchmark-artifacts
           path: |
